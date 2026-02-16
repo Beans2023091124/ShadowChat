@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: shadow-chat
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SHADOW_CHAT_DB_PATH
+        value: /var/data/shadow-chat.sqlite
+      - key: NODE_VERSION
+        value: 24
+    disk:
+      name: shadow-chat-data
+      mountPath: /var/data
+      sizeGB: 1
