@@ -2,11 +2,18 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 import express from "express";
 import { Server } from "socket.io";
+
+let DatabaseSync = null;
+
+try {
+  ({ DatabaseSync } = await import("node:sqlite"));
+} catch {
+  DatabaseSync = null;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,6 +40,9 @@ const DATA_DIR = process.env.SHADOW_CHAT_DATA_DIR
 const DB_PATH = process.env.SHADOW_CHAT_DB_PATH
   ? path.resolve(process.env.SHADOW_CHAT_DB_PATH)
   : path.join(DATA_DIR, "shadow-chat.sqlite");
+const STATE_SNAPSHOT_PATH = process.env.SHADOW_CHAT_STATE_PATH
+  ? path.resolve(process.env.SHADOW_CHAT_STATE_PATH)
+  : path.join(DATA_DIR, "shadow-chat-state.json");
 const MYSQL_URL = String(process.env.MYSQL_URL ?? "").trim();
 const MYSQL_HOST = String(process.env.MYSQL_HOST ?? "").trim();
 const MYSQL_PORT = Number(process.env.MYSQL_PORT ?? 3306);
@@ -54,7 +64,7 @@ const sessions = new Map();
 const sessionsByUser = new Map();
 let persistenceScheduled = false;
 
-let persistenceBackend = "sqlite";
+let persistenceBackend = "json";
 let mysqlPool = null;
 let selectStateStatement = null;
 let upsertStateStatement = null;
@@ -131,34 +141,52 @@ if (MYSQL_CONFIGURED) {
   } catch (error) {
     mysqlPool = null;
     const reason = error instanceof Error ? error.message : String(error);
-    console.warn(`MySQL persistence unavailable (${reason}). Falling back to SQLite.`);
+    console.warn(`MySQL persistence unavailable (${reason}). Falling back to local storage.`);
   }
 }
 
 if (!mysqlPool) {
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-
-  const db = new DatabaseSync(DB_PATH);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    CREATE TABLE IF NOT EXISTS app_state (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
+  try {
+    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+    fs.mkdirSync(path.dirname(STATE_SNAPSHOT_PATH), { recursive: true });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `Local persistence directories unavailable (${reason}). Continuing without disk persistence.`
     );
-  `);
+  }
 
-  selectStateStatement = db.prepare(`
-    SELECT value
-    FROM app_state
-    WHERE key = 'state_json'
-  `);
+  if (DatabaseSync) {
+    try {
+      const db = new DatabaseSync(DB_PATH);
+      db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS app_state (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+      `);
 
-  upsertStateStatement = db.prepare(`
-    INSERT INTO app_state (key, value)
-    VALUES ('state_json', ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `);
+      selectStateStatement = db.prepare(`
+        SELECT value
+        FROM app_state
+        WHERE key = 'state_json'
+      `);
+
+      upsertStateStatement = db.prepare(`
+        INSERT INTO app_state (key, value)
+        VALUES ('state_json', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `);
+      persistenceBackend = "sqlite";
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`SQLite persistence unavailable (${reason}). Falling back to JSON snapshot.`);
+    }
+  } else {
+    console.warn("SQLite module unavailable. Falling back to JSON snapshot.");
+  }
 }
 
 function normalizeUserName(value) {
@@ -478,6 +506,15 @@ function persistStateToDatabase() {
     return;
   }
 
+  if (!upsertStateStatement) {
+    try {
+      fs.writeFileSync(STATE_SNAPSHOT_PATH, serializedState, "utf8");
+    } catch (error) {
+      console.error("Failed to persist state to JSON snapshot:", error);
+    }
+    return;
+  }
+
   try {
     upsertStateStatement.run(serializedState);
   } catch (error) {
@@ -520,16 +557,29 @@ async function restoreStateFromDatabase() {
 
     serializedState = String(rows?.[0]?.value ?? "");
   } else {
-    let rawState = null;
+    if (!selectStateStatement) {
+      try {
+        if (!fs.existsSync(STATE_SNAPSHOT_PATH)) {
+          return;
+        }
 
-    try {
-      rawState = selectStateStatement.get();
-    } catch (error) {
-      console.error("Failed to read persisted state from SQLite:", error);
-      return;
+        serializedState = fs.readFileSync(STATE_SNAPSHOT_PATH, "utf8");
+      } catch (error) {
+        console.error("Failed to read persisted state from JSON snapshot:", error);
+        return;
+      }
+    } else {
+      let rawState = null;
+
+      try {
+        rawState = selectStateStatement.get();
+      } catch (error) {
+        console.error("Failed to read persisted state from SQLite:", error);
+        return;
+      }
+
+      serializedState = String(rawState?.value ?? "");
     }
-
-    serializedState = String(rawState?.value ?? "");
   }
 
   if (!serializedState) {
