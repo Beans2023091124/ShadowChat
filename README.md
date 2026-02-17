@@ -35,3 +35,4 @@ Discord-inspired real-time messaging app with a dark grey/black theme and `#a8a8
 
 - Data is currently stored in memory and resets on server restart.
 - Next step for production-style behavior is adding persistent storage and authentication.
+"# Shadow-Chat" 
