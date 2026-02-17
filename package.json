@@ -4,7 +4,7 @@
   "description": "Discord-inspired messaging app with temporary two-party close approval chats",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=18"
   },
   "scripts": {
     "dev": "node --watch server.js",
