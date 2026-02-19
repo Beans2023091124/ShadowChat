@@ -199,6 +199,8 @@ const elements = {
   remoteCameraVideo: document.getElementById("remoteCameraVideo"),
   remoteVideoPlaceholder: document.getElementById("remoteVideoPlaceholder"),
   remoteVideoPlaceholderText: document.getElementById("remoteVideoPlaceholderText"),
+  remoteVideoName: document.getElementById("remoteVideoName"),
+  localVideoName: document.getElementById("localVideoName"),
   callAnnotationCanvas: document.getElementById("callAnnotationCanvas"),
   localVideo: document.getElementById("localVideo"),
   callChatPanel: document.getElementById("callChatPanel"),
@@ -221,6 +223,13 @@ const contextMenuElement = document.createElement("div");
 contextMenuElement.id = "contextMenu";
 contextMenuElement.className = "context-menu hidden";
 document.body.append(contextMenuElement);
+
+const remoteCallAudioElement = document.createElement("audio");
+remoteCallAudioElement.id = "remoteCallAudio";
+remoteCallAudioElement.className = "remote-call-audio";
+remoteCallAudioElement.autoplay = true;
+remoteCallAudioElement.playsInline = true;
+document.body.append(remoteCallAudioElement);
 
 const timeFormatter = new Intl.DateTimeFormat([], {
   hour: "2-digit",
@@ -249,11 +258,61 @@ const CALL_CHAT_MESSAGE_LIMIT = 80;
 const STICKER_RESULT_RENDER_LIMIT = 5000;
 const CALL_ANNOTATION_DEFAULT_COLOR = "#a8a8a8";
 const CALL_ANNOTATION_DEFAULT_WIDTH = 3;
+const CALL_DRAW_ENABLED = false;
+const CALL_AUDIO_CAPTURE_CONSTRAINTS = {
+  echoCancellation: { ideal: true },
+  noiseSuppression: { ideal: false },
+  autoGainControl: { ideal: false },
+  channelCount: { ideal: 1 },
+  sampleRate: { ideal: 48000 },
+  sampleSize: { ideal: 16 }
+};
+const CALL_VIDEO_CAPTURE_CONSTRAINTS_HIGH = {
+  width: { ideal: 2560, max: 3840, min: 1280 },
+  height: { ideal: 1440, max: 2160, min: 720 },
+  frameRate: { ideal: 30, max: 30 },
+  facingMode: { ideal: "user" }
+};
+const CALL_VIDEO_CAPTURE_CONSTRAINTS_FALLBACK = {
+  width: { ideal: 1920, max: 2560, min: 640 },
+  height: { ideal: 1080, max: 1440, min: 360 },
+  frameRate: { ideal: 30, max: 30 },
+  facingMode: { ideal: "user" }
+};
+const CALL_AUDIO_MAX_BITRATE_BPS = 96000;
+const CALL_VIDEO_MAX_BITRATE_BPS = 8000000;
+const CALL_SCREEN_SHARE_MAX_BITRATE_BPS = 12000000;
+const CALL_QUALITY_REAPPLY_ATTEMPTS = 8;
+const CALL_QUALITY_REAPPLY_INTERVAL_MS = 700;
+const DEFAULT_ICE_SERVERS = [
+  {
+    urls: [
+      "stun:stun.l.google.com:19302",
+      "stun:stun1.l.google.com:19302",
+      "stun:stun2.l.google.com:19302",
+      "stun:stun3.l.google.com:19302",
+      "stun:stun4.l.google.com:19302"
+    ]
+  }
+];
+const runtimeConfig = window.SHADOW_CHAT_RUNTIME && typeof window.SHADOW_CHAT_RUNTIME === "object"
+  ? window.SHADOW_CHAT_RUNTIME
+  : {};
+const CALL_ICE_SERVERS = (() => {
+  const configured = normalizeRuntimeIceServers(runtimeConfig.iceServers);
+  return configured.length > 0 ? configured : DEFAULT_ICE_SERVERS;
+})();
+const CALL_ICE_TRANSPORT_POLICY =
+  String(runtimeConfig.iceTransportPolicy ?? "").trim().toLowerCase() === "relay"
+    ? "relay"
+    : "all";
 const MAX_GROUP_CREATE_EXTRA_MEMBERS = 8;
 const EMOJI_DATASET_URL = "https://cdn.jsdelivr.net/npm/emojibase-data/en/compact.json";
 const TENOR_API_ENDPOINT = "https://tenor.googleapis.com/v2/search";
 const TENOR_API_KEY =
-  window.SHADOW_CHAT_TENOR_KEY || "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw";
+  window.SHADOW_CHAT_TENOR_KEY ||
+  String(runtimeConfig.tenorApiKey ?? "").trim() ||
+  "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw";
 const TENOR_CLIENT_KEY = "shadow_chat";
 const TENOR_RESULT_LIMIT = 18;
 const LOCAL_VIDEO_CORNERS = [
@@ -280,6 +339,7 @@ let callDurationTimer;
 let callQualityTimer;
 let callReconnectTimer;
 let callVoiceActivityTimer;
+let callQualityProfileRetryTimer;
 let localTypingPulseTimer;
 let localTypingChatId = null;
 let localTypingActive = false;
@@ -362,6 +422,11 @@ function clearCallReconnectTimer() {
 function clearCallVoiceActivityTimer() {
   clearInterval(callVoiceActivityTimer);
   callVoiceActivityTimer = undefined;
+}
+
+function clearCallQualityProfileRetryTimer() {
+  clearTimeout(callQualityProfileRetryTimer);
+  callQualityProfileRetryTimer = undefined;
 }
 
 function syncCallFocusState() {
@@ -551,8 +616,14 @@ function sanitizeChatWallpaper(value) {
     return raw;
   }
 
+  let candidate = raw;
+
+  if (!/^https?:\/\//i.test(candidate) && /^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
   try {
-    const parsed = new URL(raw);
+    const parsed = new URL(candidate);
 
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
       return parsed.toString();
@@ -560,6 +631,30 @@ function sanitizeChatWallpaper(value) {
   } catch {}
 
   return "";
+}
+
+function wallpaperCssUrlValue(value) {
+  const raw = String(value ?? "").trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  if (raw.startsWith("data:image/")) {
+    return raw.replace(/\s+/g, "").replace(/"/g, "%22");
+  }
+
+  let candidate = raw;
+
+  if (!/^https?:\/\//i.test(candidate) && /^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
+  try {
+    return new URL(candidate).toString();
+  } catch {
+    return "";
+  }
 }
 
 function activeChatViewerPrefs() {
@@ -614,9 +709,14 @@ function applyActiveChatAppearance() {
   }
 
   if (prefs.wallpaper) {
-    const escapedWallpaper = prefs.wallpaper.replace(/"/g, "%22");
+    const cssWallpaperUrl = wallpaperCssUrlValue(prefs.wallpaper);
+
+    if (!cssWallpaperUrl) {
+      return;
+    }
+
     elements.messages.classList.add("has-wallpaper");
-    elements.messages.style.backgroundImage = `linear-gradient(rgba(14, 14, 16, 0.76), rgba(14, 14, 16, 0.76)), url("${escapedWallpaper}")`;
+    elements.messages.style.backgroundImage = `linear-gradient(rgba(14, 14, 16, 0.76), rgba(14, 14, 16, 0.76)), url("${cssWallpaperUrl}")`;
     elements.messages.style.backgroundSize = "cover";
     elements.messages.style.backgroundPosition = "center";
     elements.messages.style.backgroundRepeat = "no-repeat";
@@ -1584,7 +1684,7 @@ async function promptSetActiveChatWallpaper() {
   const prefs = activeChatViewerPrefs();
   const wallpaper = await openInlinePrompt({
     title: "Chat wallpaper",
-    description: "Use an image URL or data:image URL. Leave empty to clear.",
+    description: "Use an image URL or data:image URL. This is shared with everyone in this chat.",
     initialValue: prefs.wallpaper,
     placeholder: "https://example.com/wallpaper.jpg",
     submitLabel: "Save",
@@ -1600,7 +1700,7 @@ async function promptSetActiveChatWallpaper() {
     {
       wallpaper
     },
-    String(wallpaper).trim() ? "Wallpaper saved." : "Wallpaper cleared."
+    String(wallpaper).trim() ? "Shared wallpaper saved." : "Shared wallpaper cleared."
   );
 }
 
@@ -1622,7 +1722,7 @@ function openActiveChatStyleMenu(anchorElement) {
       }
     },
     {
-      label: "Set wallpaper URL",
+      label: "Set shared wallpaper URL",
       onSelect: () => {
         promptSetActiveChatWallpaper();
       }
@@ -1640,9 +1740,9 @@ function openActiveChatStyleMenu(anchorElement) {
 
   if (prefs.wallpaper) {
     items.push({
-      label: "Clear wallpaper",
+      label: "Clear shared wallpaper",
       onSelect: () => {
-        saveActiveChatPreferences({ wallpaper: "" }, "Wallpaper cleared.");
+        saveActiveChatPreferences({ wallpaper: "" }, "Shared wallpaper cleared.");
       }
     });
   }
@@ -1657,9 +1757,14 @@ function openActiveChatStyleMenu(anchorElement) {
 
   for (const theme of CHAT_THEME_OPTIONS) {
     items.push({
-      label: `${prefs.theme === theme ? "Theme * " : "Theme "} ${themeLabel[theme] ?? theme}`,
+      label: `${prefs.theme === theme ? "Shared Theme * " : "Shared Theme "} ${
+        themeLabel[theme] ?? theme
+      }`,
       onSelect: () => {
-        saveActiveChatPreferences({ theme }, `Theme set to ${themeLabel[theme] ?? theme}.`);
+        saveActiveChatPreferences(
+          { theme },
+          `Shared theme set to ${themeLabel[theme] ?? theme}.`
+        );
       }
     });
   }
@@ -5232,6 +5337,10 @@ function renderActiveChat() {
   renderCallChat();
   updateHeaderActions();
   renderProfilePanel();
+  if (state.call && state.call.chatId === chat.id) {
+    state.call.remoteName = callRemoteDisplayName(state.call.remoteUserKey, state.call.remoteName);
+    renderCallIdentity();
+  }
   markActiveChatRead();
   updateVoiceNoteButton();
 }
@@ -6446,19 +6555,128 @@ function renderCallConnectionState() {
   elements.voiceCallRemoteUser.classList.toggle("hidden", awaitingRemote);
 }
 
+function callScreenSharePreviewTrack() {
+  const track = state.call?.screenShareStream?.getVideoTracks?.()[0] ?? null;
+  return isLiveTrack(track) ? track : null;
+}
+
+function isVoiceCallVisualStageActive(callState = state.call) {
+  if (!callState || callState.mode !== "voice") {
+    return false;
+  }
+
+  const localScreenTrack = callState.screenShareStream?.getVideoTracks?.()[0] ?? null;
+
+  return (
+    callState.isScreenSharing === true ||
+    callState.remoteScreenSharing === true ||
+    isLiveTrack(callState.remoteVideoTracks?.screen) ||
+    isLiveTrack(localScreenTrack)
+  );
+}
+
+function renderCallStageMode() {
+  const voiceMode = Boolean(state.call) && state.call.mode === "voice";
+  const voiceSharing = voiceMode && isVoiceCallVisualStageActive(state.call);
+  elements.callOverlay.classList.toggle("voice-mode", voiceMode);
+  elements.callOverlay.classList.toggle("voice-sharing", voiceSharing);
+}
+
+function callRemoteDisplayName(userKey, fallbackName = "Friend") {
+  const activeChatId = String(state.activeChat?.id ?? "").trim();
+  const callChatId = String(state.call?.chatId ?? activeChatId).trim();
+  const nickname =
+    activeChatId && activeChatId === callChatId
+      ? String(state.activeChat?.viewerPrefs?.nickname ?? "").trim()
+      : "";
+
+  if (nickname) {
+    return nickname;
+  }
+
+  const resolved = resolveUserByKey(userKey);
+  const resolvedName = String(resolved?.name ?? "").trim();
+
+  if (resolvedName) {
+    return resolvedName;
+  }
+
+  const fallback = String(fallbackName ?? "").trim();
+  return fallback || "Friend";
+}
+
+function renderCallIdentity() {
+  if (!state.call) {
+    if (elements.remoteVideoName) {
+      elements.remoteVideoName.textContent = "";
+    }
+
+    if (elements.localVideoName) {
+      elements.localVideoName.textContent = "";
+    }
+
+    return;
+  }
+
+  const modeLabel = state.call.mode === "video" ? "Video" : "Voice";
+  const remoteName = String(state.call.remoteName ?? "Friend").trim() || "Friend";
+  const selfName = String(state.currentUser?.name ?? "You").trim() || "You";
+
+  elements.callTitle.textContent = `${modeLabel} Call with ${remoteName}`;
+  elements.voiceCallName.textContent = remoteName;
+  elements.voiceCallSelfName.textContent = selfName;
+
+  if (elements.remoteVideoName) {
+    elements.remoteVideoName.textContent = remoteName;
+  }
+
+  if (elements.localVideoName) {
+    elements.localVideoName.textContent = selfName;
+  }
+}
+
+function clearRemoteCallAudioPlayback() {
+  remoteCallAudioElement.pause();
+  remoteCallAudioElement.srcObject = null;
+}
+
+function attachRemoteCallAudioTrack(track) {
+  if (!state.call || !track || track.kind !== "audio") {
+    return;
+  }
+
+  if (!(state.call.remoteStream instanceof MediaStream)) {
+    state.call.remoteStream = new MediaStream();
+  }
+
+  const hasTrack = state.call.remoteStream.getAudioTracks().some((entry) => entry.id === track.id);
+
+  if (!hasTrack) {
+    state.call.remoteStream.addTrack(track);
+  }
+
+  if (remoteCallAudioElement.srcObject !== state.call.remoteStream) {
+    remoteCallAudioElement.srcObject = state.call.remoteStream;
+  }
+
+  remoteCallAudioElement.muted = false;
+  remoteCallAudioElement.play().catch(() => {});
+}
+
 function startCallUi(mode, remoteName, statusText) {
   if (state.call && typeof state.call.chatOpen !== "boolean") {
     state.call.chatOpen = !isMobileViewport();
   }
 
   elements.callOverlay.classList.remove("hidden");
-  elements.callOverlay.classList.toggle("voice-mode", mode === "voice");
   elements.callOverlay.classList.remove("connected");
-  elements.callTitle.textContent = `${mode === "video" ? "Video" : "Voice"} Call with ${remoteName}`;
+  renderCallStageMode();
+  if (state.call) {
+    state.call.remoteName = String(remoteName ?? state.call.remoteName ?? "Friend").trim() || "Friend";
+  }
+  renderCallIdentity();
   elements.callStatus.textContent = statusText;
   elements.callModeBadge.textContent = mode === "video" ? "Video" : "Voice";
-  elements.voiceCallName.textContent = remoteName;
-  elements.voiceCallSelfName.textContent = state.currentUser?.name || "You";
 
   const remoteUser = resolveUserByKey(state.call?.remoteUserKey) ?? {
     name: remoteName
@@ -6471,7 +6689,7 @@ function startCallUi(mode, remoteName, statusText) {
   resetRemoteCameraVideoPosition();
   applyLocalVideoCorner(state.call?.localVideoCorner ?? preferredLocalVideoCorner, false);
   resizeCallAnnotationCanvas();
-  setCallDrawEnabled(state.call?.drawEnabled === true && mode === "video");
+  setCallDrawEnabled(false);
   renderCallConnectionState();
   renderCallDuration();
   renderCallQualityBadge();
@@ -6856,11 +7074,14 @@ function setCallDrawEnabled(enabled) {
     return;
   }
 
-  state.call.drawEnabled = Boolean(enabled);
+  const nextEnabled = CALL_DRAW_ENABLED ? Boolean(enabled) : false;
+  state.call.drawEnabled = nextEnabled;
   elements.callAnnotationCanvas.classList.toggle("draw-enabled", state.call.drawEnabled);
   elements.callAnnotationCanvas.style.pointerEvents = state.call.drawEnabled ? "auto" : "none";
-  elements.toggleDrawButton.classList.toggle("active", state.call.drawEnabled);
-  elements.toggleDrawButton.textContent = state.call.drawEnabled ? "Draw On" : "Draw Off";
+  if (elements.toggleDrawButton) {
+    elements.toggleDrawButton.classList.toggle("active", state.call.drawEnabled);
+    elements.toggleDrawButton.textContent = state.call.drawEnabled ? "Draw On" : "Draw Off";
+  }
 
   if (!state.call.drawEnabled) {
     callAnnotationPointerState = null;
@@ -6868,7 +7089,7 @@ function setCallDrawEnabled(enabled) {
 }
 
 function toggleCallDraw() {
-  if (!state.call || state.call.mode !== "video" || !state.call.connected) {
+  if (!CALL_DRAW_ENABLED || !state.call || state.call.mode !== "video" || !state.call.connected) {
     return;
   }
 
@@ -6876,7 +7097,7 @@ function toggleCallDraw() {
 }
 
 function clearCallDrawAndSync() {
-  if (!state.call || state.call.mode !== "video" || !state.call.connected) {
+  if (!CALL_DRAW_ENABLED || !state.call || state.call.mode !== "video" || !state.call.connected) {
     return;
   }
 
@@ -6928,9 +7149,11 @@ function resetRemoteCameraVideoPosition() {
 }
 
 function syncRemoteVideoElements() {
-  if (!state.call || state.call.mode !== "video") {
+  if (!state.call) {
+    elements.remoteVideo.srcObject = null;
     elements.remoteCameraVideo.srcObject = null;
     elements.remoteCameraVideo.classList.add("hidden");
+    renderCallStageMode();
     return;
   }
 
@@ -6947,12 +7170,24 @@ function syncRemoteVideoElements() {
   const cameraTrack = isLiveTrack(state.call.remoteVideoTracks.camera)
     ? state.call.remoteVideoTracks.camera
     : null;
+  const localPreviewTrack = callScreenSharePreviewTrack();
   const sharingPreferred = state.call.remoteScreenSharing === true || Boolean(screenTrack);
-  const mainTrack = sharingPreferred ? screenTrack ?? cameraTrack : cameraTrack ?? screenTrack;
-  const showRemoteCameraTile = sharingPreferred && Boolean(screenTrack) && Boolean(cameraTrack);
+  const isVoiceMode = state.call.mode === "voice";
+  let mainTrack = null;
+  let showRemoteCameraTile = false;
+
+  if (isVoiceMode) {
+    if (sharingPreferred) {
+      mainTrack = screenTrack ?? cameraTrack;
+    } else if (state.call.isScreenSharing === true && localPreviewTrack) {
+      mainTrack = localPreviewTrack;
+    }
+  } else {
+    mainTrack = sharingPreferred ? screenTrack ?? cameraTrack : cameraTrack ?? screenTrack;
+    showRemoteCameraTile = sharingPreferred && Boolean(screenTrack) && Boolean(cameraTrack);
+  }
 
   setVideoElementTrack(elements.remoteVideo, mainTrack);
-  state.call.remoteStream = elements.remoteVideo.srcObject ?? null;
   state.call.remoteScreenSharing = sharingPreferred;
 
   if (showRemoteCameraTile) {
@@ -6964,10 +7199,16 @@ function syncRemoteVideoElements() {
     resetRemoteCameraVideoPosition();
     stopRemoteVideoDrag();
   }
+
+  renderCallStageMode();
 }
 
 function renderRemoteVideoPlaceholder() {
-  if (!state.call || state.call.mode !== "video" || !state.call.connected) {
+  const visualStageActive =
+    Boolean(state.call) &&
+    (state.call.mode === "video" || isVoiceCallVisualStageActive(state.call));
+
+  if (!state.call || !visualStageActive || !state.call.connected) {
     elements.remoteVideoPlaceholder.classList.add("hidden");
     return;
   }
@@ -7002,7 +7243,6 @@ function syncRemoteScreenShareLayout() {
 
   const remoteSharing =
     Boolean(state.call) &&
-    state.call.mode === "video" &&
     state.call.connected === true &&
     state.call.remoteScreenSharing === true;
   elements.callVideos.classList.toggle("remote-screen-share", remoteSharing);
@@ -7026,7 +7266,7 @@ function renderRemoteMediaIndicators() {
   const cameraEnabled = state.call.remoteCameraEnabled !== false;
   const screenSharing =
     state.call.remoteScreenSharing === true || isLiveTrack(state.call.remoteVideoTracks?.screen);
-  const isVideoCall = state.call.mode === "video";
+  const canShowVisualState = state.call.mode === "video" || screenSharing;
 
   elements.remoteMediaStatus.classList.remove("hidden");
 
@@ -7035,10 +7275,10 @@ function renderRemoteMediaIndicators() {
     ? `${remoteName}: mic on`
     : `${remoteName}: muted`;
 
-  elements.remoteCameraIndicator.classList.toggle("hidden", !isVideoCall);
+  elements.remoteCameraIndicator.classList.toggle("hidden", !canShowVisualState);
   elements.remoteCameraIndicator.classList.toggle("off", !cameraEnabled && !screenSharing);
 
-  if (isVideoCall) {
+  if (canShowVisualState) {
     if (screenSharing) {
       elements.remoteCameraIndicator.textContent = `${remoteName}: sharing screen`;
     } else {
@@ -7050,6 +7290,7 @@ function renderRemoteMediaIndicators() {
 
   syncRemoteScreenShareLayout();
   renderRemoteVideoPlaceholder();
+  renderCallStageMode();
 }
 
 function emitCallMediaState() {
@@ -7090,10 +7331,499 @@ function findVideoSender(peer) {
     return null;
   }
 
-  return (
-    peer.getSenders().find((sender) => sender.track && sender.track.kind === "video") ??
-    null
-  );
+  const withTrack = peer.getSenders().find((sender) => sender.track && sender.track.kind === "video");
+
+  if (withTrack) {
+    return withTrack;
+  }
+
+  const viaTransceiver = peer
+    .getTransceivers()
+    .find((transceiver) => transceiver?.receiver?.track?.kind === "video");
+
+  return viaTransceiver?.sender ?? null;
+}
+
+function normalizeRuntimeIceServers(rawIceServers) {
+  if (!Array.isArray(rawIceServers)) {
+    return [];
+  }
+
+  const normalized = [];
+
+  for (const rawEntry of rawIceServers) {
+    if (!rawEntry || typeof rawEntry !== "object") {
+      continue;
+    }
+
+    const urlsValue = rawEntry.urls;
+    const urls = Array.isArray(urlsValue)
+      ? urlsValue.map((url) => String(url ?? "").trim()).filter(Boolean)
+      : [String(urlsValue ?? "").trim()].filter(Boolean);
+
+    if (urls.length === 0) {
+      continue;
+    }
+
+    const entry = {
+      urls: urls.length === 1 ? urls[0] : [...new Set(urls)]
+    };
+    const username = String(rawEntry.username ?? "").trim();
+    const credential = String(rawEntry.credential ?? "").trim();
+
+    if (username) {
+      entry.username = username;
+    }
+
+    if (credential) {
+      entry.credential = credential;
+    }
+
+    if (String(rawEntry.credentialType ?? "").trim().toLowerCase() === "oauth") {
+      entry.credentialType = "oauth";
+    }
+
+    normalized.push(entry);
+  }
+
+  return normalized;
+}
+
+function ensureCallVideoSender(peer) {
+  if (!peer) {
+    return {
+      sender: null,
+      created: false
+    };
+  }
+
+  const existing = findVideoSender(peer);
+
+  if (existing) {
+    return {
+      sender: existing,
+      created: false
+    };
+  }
+
+  try {
+    const transceiver = peer.addTransceiver("video", { direction: "sendrecv" });
+    return {
+      sender: transceiver?.sender ?? null,
+      created: true
+    };
+  } catch {
+    return {
+      sender: null,
+      created: false
+    };
+  }
+}
+
+function videoCodecPriority(codec) {
+  const mimeType = String(codec?.mimeType ?? "").trim().toLowerCase();
+
+  switch (mimeType) {
+    case "video/vp9":
+      return 0;
+    case "video/h264":
+      return 1;
+    case "video/vp8":
+      return 2;
+    case "video/av1":
+      return 3;
+    default:
+      return 10;
+  }
+}
+
+function applyPreferredVideoCodecOrder(peer) {
+  if (
+    !peer ||
+    typeof RTCRtpSender === "undefined" ||
+    typeof RTCRtpSender.getCapabilities !== "function"
+  ) {
+    return;
+  }
+
+  const capabilities = RTCRtpSender.getCapabilities("video");
+  const codecs = Array.isArray(capabilities?.codecs) ? capabilities.codecs : [];
+
+  if (codecs.length === 0) {
+    return;
+  }
+
+  const orderedCodecs = [...codecs].sort((left, right) => {
+    return videoCodecPriority(left) - videoCodecPriority(right);
+  });
+
+  for (const transceiver of peer.getTransceivers()) {
+    if (!transceiver || typeof transceiver.setCodecPreferences !== "function") {
+      continue;
+    }
+
+    const senderKind = transceiver.sender?.track?.kind ?? null;
+    const receiverKind = transceiver.receiver?.track?.kind ?? null;
+
+    if (senderKind !== "video" && receiverKind !== "video") {
+      continue;
+    }
+
+    try {
+      transceiver.setCodecPreferences(orderedCodecs);
+    } catch {}
+  }
+}
+
+function buildSupportedMediaConstraints(constraints) {
+  const source = constraints && typeof constraints === "object" ? constraints : {};
+  const supported = navigator.mediaDevices?.getSupportedConstraints?.() ?? null;
+
+  if (!supported || typeof supported !== "object" || Object.keys(supported).length === 0) {
+    return { ...source };
+  }
+
+  const filtered = {};
+
+  for (const [key, value] of Object.entries(source)) {
+    if (supported[key] === true) {
+      filtered[key] = value;
+    }
+  }
+
+  return filtered;
+}
+
+async function applyCameraTrackQualityFromCapabilities(track) {
+  if (!track || track.kind !== "video" || typeof track.applyConstraints !== "function") {
+    return;
+  }
+
+  const capabilities = track.getCapabilities?.() ?? null;
+
+  if (!capabilities || typeof capabilities !== "object") {
+    return;
+  }
+
+  const nextConstraints = {};
+  const widthMax = Number(capabilities.width?.max);
+  const heightMax = Number(capabilities.height?.max);
+  const frameRateMax = Number(capabilities.frameRate?.max);
+  const aspectRatioMax = Number(capabilities.aspectRatio?.max);
+  const aspectRatioMin = Number(capabilities.aspectRatio?.min);
+
+  if (Number.isFinite(widthMax) && widthMax > 0) {
+    const targetWidth = Math.min(2560, Math.floor(widthMax));
+    nextConstraints.width = { ideal: targetWidth, max: targetWidth };
+  }
+
+  if (Number.isFinite(heightMax) && heightMax > 0) {
+    const targetHeight = Math.min(1440, Math.floor(heightMax));
+    nextConstraints.height = { ideal: targetHeight, max: targetHeight };
+  }
+
+  if (Number.isFinite(frameRateMax) && frameRateMax > 0) {
+    const targetFps = Math.min(30, Math.max(24, Math.floor(frameRateMax)));
+    nextConstraints.frameRate = { ideal: targetFps, max: targetFps };
+  }
+
+  if (
+    Number.isFinite(aspectRatioMax) &&
+    Number.isFinite(aspectRatioMin) &&
+    aspectRatioMax >= 1.7 &&
+    aspectRatioMin <= 1.78
+  ) {
+    nextConstraints.aspectRatio = { ideal: 1.7777777778 };
+  }
+
+  if (Object.keys(nextConstraints).length === 0) {
+    return;
+  }
+
+  try {
+    await track.applyConstraints(nextConstraints);
+  } catch {}
+}
+
+function mergeFmtpParameters(baseValue, additions) {
+  const merged = new Map();
+  const tokens = String(baseValue ?? "")
+    .split(";")
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  for (const token of tokens) {
+    const separatorIndex = token.indexOf("=");
+
+    if (separatorIndex === -1) {
+      merged.set(token, "");
+      continue;
+    }
+
+    const key = token.slice(0, separatorIndex).trim();
+    const value = token.slice(separatorIndex + 1).trim();
+    merged.set(key, value);
+  }
+
+  for (const [key, value] of Object.entries(additions ?? {})) {
+    merged.set(String(key), String(value));
+  }
+
+  return [...merged.entries()]
+    .map(([key, value]) => (value.length > 0 ? `${key}=${value}` : key))
+    .join(";");
+}
+
+function applyOpusFmtpToSdp(sdp) {
+  const source = String(sdp ?? "");
+
+  if (!source) {
+    return source;
+  }
+
+  const rtpMapMatch = source.match(/a=rtpmap:(\d+)\s+opus\/48000(?:\/2)?/i);
+
+  if (!rtpMapMatch) {
+    return source;
+  }
+
+  const payloadType = rtpMapMatch[1];
+  const additions = {
+    minptime: "10",
+    maxaveragebitrate: String(CALL_AUDIO_MAX_BITRATE_BPS),
+    stereo: "0",
+    "sprop-stereo": "0",
+    useinbandfec: "1",
+    cbr: "1"
+  };
+  const fmtpPattern = new RegExp(`a=fmtp:${payloadType}\\s+([^\\r\\n]*)`, "i");
+
+  if (fmtpPattern.test(source)) {
+    return source.replace(fmtpPattern, (_match, params) => {
+      return `a=fmtp:${payloadType} ${mergeFmtpParameters(params, additions)}`;
+    });
+  }
+
+  const rtpMapLinePattern = new RegExp(`a=rtpmap:${payloadType}\\s+opus\\/48000(?:\\/2)?`, "i");
+  return source.replace(rtpMapLinePattern, (line) => {
+    return `${line}\r\na=fmtp:${payloadType} ${mergeFmtpParameters("", additions)}`;
+  });
+}
+
+function applyVideoFmtpToSdp(sdp, targetVideoBitrate) {
+  const source = String(sdp ?? "");
+
+  if (!source) {
+    return source;
+  }
+
+  const targetKbps = Math.max(600, Math.round(Number(targetVideoBitrate || 0) / 1000));
+  const startKbps = Math.max(900, Math.round(targetKbps * 0.55));
+  const minKbps = Math.max(350, Math.round(targetKbps * 0.2));
+  const additions = {
+    "x-google-start-bitrate": String(startKbps),
+    "x-google-max-bitrate": String(targetKbps),
+    "x-google-min-bitrate": String(minKbps)
+  };
+  const matches = [...source.matchAll(/a=rtpmap:(\d+)\s+(VP8|VP9|H264)\/90000/gi)];
+
+  if (matches.length === 0) {
+    return source;
+  }
+
+  let nextSdp = source;
+
+  for (const match of matches) {
+    const payloadType = match[1];
+    const fmtpPattern = new RegExp(`a=fmtp:${payloadType}\\s+([^\\r\\n]*)`, "i");
+
+    if (fmtpPattern.test(nextSdp)) {
+      nextSdp = nextSdp.replace(fmtpPattern, (_line, params) => {
+        return `a=fmtp:${payloadType} ${mergeFmtpParameters(params, additions)}`;
+      });
+      continue;
+    }
+
+    const rtpMapLinePattern = new RegExp(
+      `a=rtpmap:${payloadType}\\s+(VP8|VP9|H264)\\/90000`,
+      "i"
+    );
+    nextSdp = nextSdp.replace(rtpMapLinePattern, (line) => {
+      return `${line}\r\na=fmtp:${payloadType} ${mergeFmtpParameters("", additions)}`;
+    });
+  }
+
+  return nextSdp;
+}
+
+function applyBitrateToMediaSections(sdp, mediaType, bitrateBps) {
+  const source = String(sdp ?? "");
+  const normalizedMediaType = String(mediaType ?? "").trim().toLowerCase();
+  const kbps = Math.max(32, Math.round(Number(bitrateBps || 0) / 1000));
+  const bps = Math.max(32000, Math.round(Number(bitrateBps || 0)));
+
+  if (!source || !normalizedMediaType || !Number.isFinite(kbps) || !Number.isFinite(bps)) {
+    return source;
+  }
+
+  const sections = source.split("\r\nm=");
+
+  if (sections.length <= 1) {
+    return source;
+  }
+
+  const sessionLevel = sections.shift() ?? "";
+  const mediaSections = sections.map((section) => `m=${section}`);
+  const updatedSections = mediaSections.map((section) => {
+    if (!section.startsWith(`m=${normalizedMediaType} `)) {
+      return section;
+    }
+
+    const lines = section.split("\r\n").filter((line) => !/^b=(AS|TIAS):/i.test(line));
+    let insertIndex = lines.findIndex((line) => line.startsWith("c="));
+
+    if (insertIndex === -1) {
+      insertIndex = 1;
+    } else {
+      insertIndex += 1;
+    }
+
+    lines.splice(insertIndex, 0, `b=AS:${kbps}`, `b=TIAS:${bps}`);
+    return lines.join("\r\n");
+  });
+
+  return [sessionLevel, ...updatedSections].join("\r\n");
+}
+
+function optimizeLocalSessionDescription(description, { screenShare = false } = {}) {
+  if (!description || typeof description.sdp !== "string") {
+    return description;
+  }
+
+  const targetVideoBitrate = screenShare ? CALL_SCREEN_SHARE_MAX_BITRATE_BPS : CALL_VIDEO_MAX_BITRATE_BPS;
+  let optimizedSdp = description.sdp;
+  optimizedSdp = applyOpusFmtpToSdp(optimizedSdp);
+  optimizedSdp = applyBitrateToMediaSections(optimizedSdp, "audio", CALL_AUDIO_MAX_BITRATE_BPS);
+  optimizedSdp = applyBitrateToMediaSections(optimizedSdp, "video", targetVideoBitrate);
+  optimizedSdp = applyVideoFmtpToSdp(optimizedSdp, targetVideoBitrate);
+
+  return {
+    type: description.type,
+    sdp: optimizedSdp
+  };
+}
+
+function applyOutboundQualityProfile({ screenShare = false } = {}) {
+  if (!state.call?.peer) {
+    return;
+  }
+
+  const preferScreenShare = screenShare === true || state.call.isScreenSharing === true;
+
+  for (const sender of state.call.peer.getSenders()) {
+    if (
+      !sender ||
+      typeof sender.getParameters !== "function" ||
+      typeof sender.setParameters !== "function"
+    ) {
+      continue;
+    }
+
+    const track = sender.track;
+
+    if (!track) {
+      continue;
+    }
+
+    const params = sender.getParameters() || {};
+
+    if (!Array.isArray(params.encodings) || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+
+    const [encoding] = params.encodings;
+
+    if (track.kind === "audio") {
+      if ("contentHint" in track) {
+        track.contentHint = "speech";
+      }
+
+      encoding.maxBitrate = CALL_AUDIO_MAX_BITRATE_BPS;
+
+      if ("dtx" in encoding) {
+        encoding.dtx = "disabled";
+      }
+
+      if ("networkPriority" in encoding) {
+        encoding.networkPriority = "high";
+      }
+
+      if ("priority" in encoding) {
+        encoding.priority = "high";
+      }
+    } else if (track.kind === "video") {
+      if ("contentHint" in track) {
+        track.contentHint = "motion";
+      }
+
+      encoding.maxBitrate = preferScreenShare
+        ? CALL_SCREEN_SHARE_MAX_BITRATE_BPS
+        : CALL_VIDEO_MAX_BITRATE_BPS;
+
+      if ("maxFramerate" in encoding) {
+        encoding.maxFramerate = preferScreenShare ? 30 : 60;
+      }
+
+      if ("scaleResolutionDownBy" in encoding) {
+        encoding.scaleResolutionDownBy = 1;
+      }
+
+      if ("networkPriority" in encoding) {
+        encoding.networkPriority = "high";
+      }
+
+      if ("priority" in encoding) {
+        encoding.priority = "high";
+      }
+
+      params.degradationPreference = "maintain-resolution";
+    } else {
+      continue;
+    }
+
+    sender.setParameters(params).catch(() => {});
+  }
+}
+
+function scheduleOutboundQualityProfileRefresh(options = {}) {
+  const explicitScreenShare = options?.screenShare;
+  clearCallQualityProfileRetryTimer();
+
+  let remainingAttempts = CALL_QUALITY_REAPPLY_ATTEMPTS;
+
+  const run = () => {
+    if (!state.call?.peer) {
+      clearCallQualityProfileRetryTimer();
+      return;
+    }
+
+    const preferScreenShare =
+      typeof explicitScreenShare === "boolean"
+        ? explicitScreenShare
+        : state.call.isScreenSharing === true;
+
+    applyOutboundQualityProfile({ screenShare: preferScreenShare });
+    remainingAttempts -= 1;
+
+    if (remainingAttempts <= 0) {
+      clearCallQualityProfileRetryTimer();
+      return;
+    }
+
+    callQualityProfileRetryTimer = window.setTimeout(run, CALL_QUALITY_REAPPLY_INTERVAL_MS);
+  };
+
+  run();
 }
 
 async function createCompositeScreenShareTrack(displayStream, cameraStream) {
@@ -7335,12 +8065,12 @@ async function stopScreenShare(options = {}) {
   const silent = options.silent === true;
   const shareStream = state.call.screenShareStream;
   const shareCleanup = state.call.screenShareCleanup;
-  const shareSender = state.call.screenShareSender;
+  const videoSender = findVideoSender(state.call.peer);
   const cameraTrack = state.call.localStream?.getVideoTracks?.()[0] ?? null;
 
-  if (shareSender && state.call.peer) {
+  if (videoSender) {
     try {
-      state.call.peer.removeTrack(shareSender);
+      await videoSender.replaceTrack(cameraTrack ?? null);
     } catch {}
   }
 
@@ -7367,9 +8097,10 @@ async function stopScreenShare(options = {}) {
   state.call.screenShareSender = null;
   state.call.isScreenSharing = false;
   state.call.screenShareInsetPosition = null;
+  scheduleOutboundQualityProfileRefresh({ screenShare: false });
   emitCallMediaState();
   updateCallControlButtons();
-  await emitCallRenegotiationOffer();
+  syncRemoteVideoElements();
 
   if (!silent) {
     showToast("Screen sharing stopped.");
@@ -7377,7 +8108,7 @@ async function stopScreenShare(options = {}) {
 }
 
 async function startScreenShare() {
-  if (!state.call || state.call.mode !== "video" || state.call.connected !== true) {
+  if (!state.call || state.call.connected !== true) {
     return;
   }
 
@@ -7389,8 +8120,22 @@ async function startScreenShare() {
   let displayStream;
 
   try {
+    const ensuredVideoSender = ensureCallVideoSender(state.call.peer);
+    const videoSender = ensuredVideoSender.sender;
+
+    if (!videoSender) {
+      showToast("Screen sharing is unavailable for this call.");
+      return;
+    }
+
+    applyPreferredVideoCodecOrder(state.call.peer);
+
     displayStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
+      video: {
+        width: { ideal: 1920, max: 3840 },
+        height: { ideal: 1080, max: 2160 },
+        frameRate: { ideal: 30, max: 60 }
+      },
       audio: false
     });
     const displayTrack = displayStream.getVideoTracks()[0] ?? null;
@@ -7403,7 +8148,9 @@ async function startScreenShare() {
       return;
     }
 
-    const screenShareSender = state.call.peer.addTrack(displayTrack, displayStream);
+    if ("contentHint" in displayTrack) {
+      displayTrack.contentHint = "detail";
+    }
 
     displayTrack.onended = () => {
       if (state.call?.screenShareStream === displayStream) {
@@ -7411,34 +8158,36 @@ async function startScreenShare() {
       }
     };
 
+    await videoSender.replaceTrack(displayTrack);
+
+    if (ensuredVideoSender.created) {
+      const renegotiated = await emitCallRenegotiationOffer();
+
+      if (!renegotiated) {
+        try {
+          const fallbackTrack = state.call?.localStream?.getVideoTracks?.()[0] ?? null;
+          await videoSender.replaceTrack(fallbackTrack ?? null);
+        } catch {}
+
+        for (const track of displayStream.getTracks()) {
+          track.onended = null;
+          track.stop();
+        }
+
+        showToast("Could not start screen share. Try again.");
+        return;
+      }
+    }
+
     state.call.screenShareStream = displayStream;
     state.call.screenShareCleanup = null;
-    state.call.screenShareSender = screenShareSender;
+    state.call.screenShareSender = null;
     state.call.isScreenSharing = true;
     elements.localVideo.srcObject = state.call.localStream;
+    scheduleOutboundQualityProfileRefresh({ screenShare: true });
     emitCallMediaState();
     updateCallControlButtons();
-
-    const renegotiated = await emitCallRenegotiationOffer();
-
-    if (!renegotiated) {
-      if (screenShareSender && state.call?.peer) {
-        try {
-          state.call.peer.removeTrack(screenShareSender);
-        } catch {}
-      }
-      for (const track of displayStream.getTracks()) {
-        track.onended = null;
-        track.stop();
-      }
-      state.call.screenShareStream = null;
-      state.call.screenShareSender = null;
-      state.call.isScreenSharing = false;
-      emitCallMediaState();
-      updateCallControlButtons();
-      showToast("Could not start screen share.");
-      return;
-    }
+    syncRemoteVideoElements();
 
     showToast("Screen sharing started.");
   } catch {
@@ -7452,7 +8201,7 @@ async function startScreenShare() {
 }
 
 async function toggleScreenShare() {
-  if (!state.call || state.call.mode !== "video") {
+  if (!state.call || state.call.connected !== true) {
     return;
   }
 
@@ -7482,21 +8231,28 @@ function updateCallControlButtons() {
   elements.toggleCameraButton.textContent = cameraEnabled ? "Cam On" : "Cam Off";
   elements.toggleCameraButton.classList.toggle("off", !cameraEnabled);
 
-  const canUseScreenShare = isVideoCall && isScreenShareSupported() && state.call?.connected === true;
-  elements.toggleScreenShareButton.classList.toggle("hidden", !isVideoCall);
+  const canUseScreenShare =
+    hasCall && isScreenShareSupported() && state.call?.connected === true;
+  elements.toggleScreenShareButton.classList.toggle("hidden", !hasCall);
   elements.toggleScreenShareButton.disabled = !canUseScreenShare;
   elements.toggleScreenShareButton.textContent = isScreenSharing ? "Stop Share" : "Share Screen";
   elements.toggleScreenShareButton.classList.toggle("active", isScreenSharing);
 
-  elements.toggleDrawButton.classList.toggle("hidden", !isVideoCall);
-  elements.clearDrawButton.classList.toggle("hidden", !isVideoCall);
-  elements.toggleDrawButton.disabled = !canDraw;
-  elements.clearDrawButton.disabled = !canDraw;
+  if (elements.toggleDrawButton) {
+    elements.toggleDrawButton.classList.add("hidden");
+    elements.toggleDrawButton.disabled = true;
+  }
 
-  if ((!isVideoCall || !canDraw) && state.call?.drawEnabled) {
+  if (elements.clearDrawButton) {
+    elements.clearDrawButton.classList.add("hidden");
+    elements.clearDrawButton.disabled = true;
+  }
+
+  if ((!isVideoCall || !canDraw || !CALL_DRAW_ENABLED) && state.call?.drawEnabled) {
     setCallDrawEnabled(false);
   }
 
+  renderCallStageMode();
   renderCallChatVisibility();
 }
 
@@ -7510,6 +8266,7 @@ function setCallConnected(connected, options = {}) {
   state.call.connected = connected;
 
   if (!connected) {
+    clearCallQualityProfileRetryTimer();
     clearCallQualityTimer();
     clearCallVoiceActivityTimer();
 
@@ -7536,14 +8293,20 @@ function setCallConnected(connected, options = {}) {
   renderCallDuration();
   renderCallQualityBadge();
   renderCallConnectionState();
+  renderCallStageMode();
   elements.callOverlay.classList.toggle("connected", connected);
   renderRemoteMediaIndicators();
   resizeCallAnnotationCanvas();
   updateVoiceActivityUi();
   renderCallChat();
+  updateCallControlButtons();
 
   if (connected) {
+    scheduleOutboundQualityProfileRefresh();
     emitCallMediaState();
+    if (remoteCallAudioElement.srcObject) {
+      remoteCallAudioElement.play().catch(() => {});
+    }
   }
 }
 
@@ -7658,7 +8421,10 @@ async function emitCallReconnectOffer() {
       peer.restartIce();
     }
 
-    const offer = await peer.createOffer({ iceRestart: true });
+    const rawOffer = await peer.createOffer({ iceRestart: true });
+    const offer = optimizeLocalSessionDescription(rawOffer, {
+      screenShare: state.call?.isScreenSharing === true
+    });
     await peer.setLocalDescription(offer);
 
     socket.emit("call_reconnect_offer", { chatId, offer }, (response) => {
@@ -7695,7 +8461,10 @@ async function emitCallRenegotiationOffer() {
   state.call.renegotiationPending = true;
 
   try {
-    const offer = await peer.createOffer();
+    const rawOffer = await peer.createOffer();
+    const offer = optimizeLocalSessionDescription(rawOffer, {
+      screenShare: state.call?.isScreenSharing === true
+    });
     await peer.setLocalDescription(offer);
 
     return await new Promise((resolve) => {
@@ -7778,6 +8547,7 @@ function toggleCamera() {
 
   state.call.cameraEnabled = !state.call.cameraEnabled;
   setTrackEnabled(state.call.localStream, "video", state.call.cameraEnabled);
+  scheduleOutboundQualityProfileRefresh();
   emitCallMediaState();
   updateCallControlButtons();
 }
@@ -7785,6 +8555,7 @@ function toggleCamera() {
 function cleanupCall(shouldEmitEndSignal = false) {
   clearOutgoingRingTimer();
   clearIncomingRingTimer();
+  clearCallQualityProfileRetryTimer();
   clearCallDurationTimer();
   clearCallQualityTimer();
   clearCallReconnectTimer();
@@ -7812,6 +8583,8 @@ function cleanupCall(shouldEmitEndSignal = false) {
     updateVoiceActivityUi();
     syncCallFocusState();
     updateCallControlButtons();
+    clearRemoteCallAudioPlayback();
+    renderCallIdentity();
     return;
   }
 
@@ -7902,6 +8675,7 @@ function cleanupCall(shouldEmitEndSignal = false) {
   state.call = null;
   state.pendingIncomingCall = null;
   elements.callChatInput.value = "";
+  clearRemoteCallAudioPlayback();
 
   elements.callOverlay.classList.add("hidden");
   elements.callOverlay.classList.remove("connected");
@@ -7915,11 +8689,15 @@ function cleanupCall(shouldEmitEndSignal = false) {
   updateVoiceActivityUi();
   syncCallFocusState();
   updateCallControlButtons();
+  renderCallIdentity();
 }
 
 function createPeerConnection(chatId) {
   const peer = new RTCPeerConnection({
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    iceServers: CALL_ICE_SERVERS,
+    iceTransportPolicy: CALL_ICE_TRANSPORT_POLICY,
+    bundlePolicy: "max-bundle",
+    iceCandidatePoolSize: 8
   });
 
   peer.onicecandidate = (event) => {
@@ -7946,6 +8724,7 @@ function createPeerConnection(chatId) {
 
     if (track.kind === "audio") {
       const audioStream = new MediaStream([track]);
+      attachRemoteCallAudioTrack(track);
 
       if (state.call.remoteVoiceMeter) {
         disposeVoiceMeter(state.call.remoteVoiceMeter);
@@ -7963,6 +8742,17 @@ function createPeerConnection(chatId) {
           state.call.remoteVoiceMeter = null;
         }
 
+        const remoteAudioStream = state.call.remoteStream;
+        if (remoteAudioStream instanceof MediaStream) {
+          try {
+            remoteAudioStream.removeTrack(track);
+          } catch {}
+
+          if (remoteAudioStream.getAudioTracks().length === 0) {
+            clearRemoteCallAudioPlayback();
+          }
+        }
+
         state.call.remoteAudioTrackId = null;
         state.call.remoteSpeaking = false;
         state.call.remoteSpeakingUntil = 0;
@@ -7978,7 +8768,7 @@ function createPeerConnection(chatId) {
       return;
     }
 
-    if (track.kind === "video" && state.call.mode === "video") {
+    if (track.kind === "video") {
       if (!state.call.remoteVideoTracks) {
         state.call.remoteVideoTracks = {
           screen: null,
@@ -8052,14 +8842,86 @@ async function getLocalMedia(mode) {
     return null;
   }
 
+  const wantsVideo = mode === "video";
+  const audioConstraints = buildSupportedMediaConstraints(CALL_AUDIO_CAPTURE_CONSTRAINTS);
+  const videoConstraintsHigh = buildSupportedMediaConstraints(CALL_VIDEO_CAPTURE_CONSTRAINTS_HIGH);
+  const videoConstraintsFallback = buildSupportedMediaConstraints(CALL_VIDEO_CAPTURE_CONSTRAINTS_FALLBACK);
+  const audioRequest = Object.keys(audioConstraints).length > 0 ? audioConstraints : true;
+  const videoRequestHigh = Object.keys(videoConstraintsHigh).length > 0 ? videoConstraintsHigh : true;
+  const videoRequestFallback =
+    Object.keys(videoConstraintsFallback).length > 0 ? videoConstraintsFallback : true;
+
+  const tuneTrackQuality = async (stream) => {
+    if (!stream) {
+      return null;
+    }
+
+    const audioTrack = stream.getAudioTracks()[0] ?? null;
+    const videoTrack = stream.getVideoTracks()[0] ?? null;
+
+    if (audioTrack) {
+      if ("contentHint" in audioTrack) {
+        audioTrack.contentHint = "speech";
+      }
+
+      if (typeof audioTrack.applyConstraints === "function") {
+        try {
+          if (audioRequest && typeof audioRequest === "object") {
+            await audioTrack.applyConstraints(audioRequest);
+          }
+        } catch {}
+      }
+    }
+
+    if (videoTrack) {
+      if ("contentHint" in videoTrack) {
+        videoTrack.contentHint = "motion";
+      }
+
+      if (typeof videoTrack.applyConstraints === "function") {
+        try {
+          if (videoRequestHigh && typeof videoRequestHigh === "object") {
+            await videoTrack.applyConstraints(videoRequestHigh);
+          }
+        } catch {
+          try {
+            if (videoRequestFallback && typeof videoRequestFallback === "object") {
+              await videoTrack.applyConstraints(videoRequestFallback);
+            }
+          } catch {}
+        }
+      }
+
+      await applyCameraTrackQualityFromCapabilities(videoTrack);
+    }
+
+    return stream;
+  };
+
   try {
-    return await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: mode === "video"
-    });
+    return await tuneTrackQuality(await navigator.mediaDevices.getUserMedia({
+      audio: audioRequest,
+      video: wantsVideo ? videoRequestHigh : false
+    }));
   } catch {
-    showToast("Camera or microphone access was denied.");
-    return null;
+    if (wantsVideo) {
+      try {
+        return await tuneTrackQuality(await navigator.mediaDevices.getUserMedia({
+          audio: audioRequest,
+          video: videoRequestFallback
+        }));
+      } catch {}
+    }
+
+    try {
+      return await tuneTrackQuality(await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: wantsVideo
+      }));
+    } catch {
+      showToast("Camera or microphone access was denied.");
+      return null;
+    }
   }
 }
 
@@ -8088,11 +8950,18 @@ async function startOutgoingCall(mode) {
   }
 
   const chatId = state.activeChat.id;
+  const remoteDisplayName = callRemoteDisplayName(target.key, target.name);
   const peer = createPeerConnection(chatId);
 
   for (const track of localStream.getTracks()) {
     peer.addTrack(track, localStream);
   }
+
+  if (mode === "voice") {
+    ensureCallVideoSender(peer);
+  }
+
+  applyPreferredVideoCodecOrder(peer);
 
   state.call = {
     chatId,
@@ -8100,7 +8969,7 @@ async function startOutgoingCall(mode) {
     peer,
     localStream,
     remoteStream: null,
-    remoteName: target.name,
+    remoteName: remoteDisplayName,
     remoteUserKey: target.key,
     micEnabled: true,
     cameraEnabled: mode === "video",
@@ -8142,12 +9011,14 @@ async function startOutgoingCall(mode) {
   };
 
   elements.localVideo.srcObject = localStream;
-  startCallUi(mode, target.name, "Calling...");
+  startCallUi(mode, remoteDisplayName, "Calling...");
+  applyOutboundQualityProfile();
   emitCallMediaState();
   startOutgoingRingCountdown();
 
   try {
-    const offer = await peer.createOffer();
+    const rawOffer = await peer.createOffer();
+    const offer = optimizeLocalSessionDescription(rawOffer, { screenShare: false });
     await peer.setLocalDescription(offer);
 
     socket.emit(
@@ -8223,10 +9094,13 @@ async function acceptIncomingCall() {
   }
 
   const peer = createPeerConnection(incoming.chatId);
+  const remoteDisplayName = callRemoteDisplayName(incoming.fromKey ?? null, incoming.fromName);
 
   for (const track of localStream.getTracks()) {
     peer.addTrack(track, localStream);
   }
+
+  applyPreferredVideoCodecOrder(peer);
 
   state.call = {
     chatId: incoming.chatId,
@@ -8234,7 +9108,7 @@ async function acceptIncomingCall() {
     peer,
     localStream,
     remoteStream: null,
-    remoteName: incoming.fromName,
+    remoteName: remoteDisplayName,
     remoteUserKey: incoming.fromKey ?? null,
     micEnabled: true,
     cameraEnabled: incoming.mode === "video",
@@ -8276,12 +9150,14 @@ async function acceptIncomingCall() {
   };
 
   elements.localVideo.srcObject = localStream;
-  startCallUi(incoming.mode, incoming.fromName, "Connecting...");
+  startCallUi(incoming.mode, remoteDisplayName, "Connecting...");
+  applyOutboundQualityProfile();
   emitCallMediaState();
 
   try {
     await peer.setRemoteDescription(new RTCSessionDescription(incoming.offer));
-    const answer = await peer.createAnswer();
+    const rawAnswer = await peer.createAnswer();
+    const answer = optimizeLocalSessionDescription(rawAnswer, { screenShare: false });
     await peer.setLocalDescription(answer);
 
     socket.emit(
@@ -8956,13 +9832,17 @@ elements.toggleScreenShareButton.addEventListener("click", () => {
   toggleScreenShare();
 });
 
-elements.toggleDrawButton.addEventListener("click", () => {
-  toggleCallDraw();
-});
+if (elements.toggleDrawButton) {
+  elements.toggleDrawButton.addEventListener("click", () => {
+    toggleCallDraw();
+  });
+}
 
-elements.clearDrawButton.addEventListener("click", () => {
-  clearCallDrawAndSync();
-});
+if (elements.clearDrawButton) {
+  elements.clearDrawButton.addEventListener("click", () => {
+    clearCallDrawAndSync();
+  });
+}
 
 elements.toggleCallChatButton.addEventListener("click", () => {
   toggleCallChatPanel();
@@ -8989,21 +9869,23 @@ elements.remoteCameraVideo.addEventListener("pointerdown", (event) => {
   beginRemoteVideoDrag(event);
 });
 
-elements.callAnnotationCanvas.addEventListener("pointerdown", (event) => {
-  beginCallAnnotationStroke(event);
-});
+if (CALL_DRAW_ENABLED) {
+  elements.callAnnotationCanvas.addEventListener("pointerdown", (event) => {
+    beginCallAnnotationStroke(event);
+  });
 
-elements.callAnnotationCanvas.addEventListener("pointermove", (event) => {
-  updateCallAnnotationStroke(event);
-});
+  elements.callAnnotationCanvas.addEventListener("pointermove", (event) => {
+    updateCallAnnotationStroke(event);
+  });
 
-elements.callAnnotationCanvas.addEventListener("pointerup", (event) => {
-  endCallAnnotationStroke(event);
-});
+  elements.callAnnotationCanvas.addEventListener("pointerup", (event) => {
+    endCallAnnotationStroke(event);
+  });
 
-elements.callAnnotationCanvas.addEventListener("pointercancel", (event) => {
-  endCallAnnotationStroke(event);
-});
+  elements.callAnnotationCanvas.addEventListener("pointercancel", (event) => {
+    endCallAnnotationStroke(event);
+  });
+}
 
 window.addEventListener("resize", () => {
   if (!isMobileViewport()) {
@@ -9364,7 +10246,10 @@ socket.on("call_reconnect_offer", async (payload) => {
     setCallStatus("Reconnecting...");
     setCallQuality("reconnecting");
     await state.call.peer.setRemoteDescription(new RTCSessionDescription(payload.offer));
-    const answer = await state.call.peer.createAnswer();
+    const rawAnswer = await state.call.peer.createAnswer();
+    const answer = optimizeLocalSessionDescription(rawAnswer, {
+      screenShare: state.call?.isScreenSharing === true
+    });
     await state.call.peer.setLocalDescription(answer);
 
     socket.emit("call_reconnect_answer", { chatId: payload.chatId, answer }, (response) => {
@@ -9398,7 +10283,10 @@ socket.on("call_renegotiate_offer", async (payload) => {
 
   try {
     await state.call.peer.setRemoteDescription(new RTCSessionDescription(payload.offer));
-    const answer = await state.call.peer.createAnswer();
+    const rawAnswer = await state.call.peer.createAnswer();
+    const answer = optimizeLocalSessionDescription(rawAnswer, {
+      screenShare: state.call?.isScreenSharing === true
+    });
     await state.call.peer.setLocalDescription(answer);
 
     socket.emit("call_renegotiate_answer", { chatId: payload.chatId, answer }, (response) => {
@@ -9486,6 +10374,10 @@ socket.on("call_media_state", (payload) => {
   const chatId = String(payload.chatId ?? "");
 
   if (state.call && state.call.chatId === chatId) {
+    state.call.remoteName = callRemoteDisplayName(
+      state.call.remoteUserKey,
+      payload.fromName ?? state.call.remoteName
+    );
     if (typeof payload.micEnabled === "boolean") {
       state.call.remoteMicEnabled = payload.micEnabled;
       if (!payload.micEnabled) {
@@ -9502,6 +10394,7 @@ socket.on("call_media_state", (payload) => {
     syncRemoteVideoElements();
     renderRemoteMediaIndicators();
     updateVoiceActivityUi();
+    renderCallIdentity();
     return;
   }
 
@@ -9519,6 +10412,10 @@ socket.on("call_media_state", (payload) => {
 });
 
 socket.on("call_annotation", (payload) => {
+  if (!CALL_DRAW_ENABLED) {
+    return;
+  }
+
   applyRemoteCallAnnotation(payload);
 });
 
