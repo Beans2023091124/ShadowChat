@@ -58,6 +58,135 @@ const STATE_SNAPSHOT_PATH = process.env.SHADOW_CHAT_STATE_PATH
   : path.join(DATA_DIR, "shadow-chat-state.json");
 const STATE_ENCRYPTION_SECRET = String(process.env.SHADOW_CHAT_STATE_ENCRYPTION_KEY ?? "");
 
+function parseCommaSeparatedList(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizeIceServerEntry(rawEntry) {
+  if (!rawEntry || typeof rawEntry !== "object") {
+    return null;
+  }
+
+  const rawUrls = rawEntry.urls;
+  const urlsList = Array.isArray(rawUrls)
+    ? rawUrls.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+    : String(rawUrls ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+
+  if (urlsList.length === 0) {
+    return null;
+  }
+
+  const nextEntry = {
+    urls: urlsList.length === 1 ? urlsList[0] : [...new Set(urlsList)]
+  };
+  const username = String(rawEntry.username ?? "").trim();
+  const credential = String(rawEntry.credential ?? "").trim();
+  const credentialType = String(rawEntry.credentialType ?? "").trim().toLowerCase();
+
+  if (username) {
+    nextEntry.username = username.slice(0, 256);
+  }
+
+  if (credential) {
+    nextEntry.credential = credential.slice(0, 512);
+  }
+
+  if (credentialType === "oauth") {
+    nextEntry.credentialType = "oauth";
+  }
+
+  return nextEntry;
+}
+
+function parseRuntimeIceServers() {
+  const jsonRaw = String(
+    process.env.SHADOW_CHAT_ICE_SERVERS ?? process.env.SHADOW_CHAT_ICE_SERVERS_JSON ?? ""
+  ).trim();
+
+  if (jsonRaw) {
+    try {
+      const parsed = JSON.parse(jsonRaw);
+      const normalized = Array.isArray(parsed)
+        ? parsed.map((entry) => normalizeIceServerEntry(entry)).filter(Boolean)
+        : [];
+
+      if (normalized.length > 0) {
+        return normalized;
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`Invalid SHADOW_CHAT_ICE_SERVERS JSON (${reason}). Falling back to defaults.`);
+    }
+  }
+
+  const fallbackStun = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+    "stun:stun2.l.google.com:19302",
+    "stun:stun3.l.google.com:19302",
+    "stun:stun4.l.google.com:19302"
+  ];
+  const stunServers = parseCommaSeparatedList(process.env.SHADOW_CHAT_STUN_SERVERS);
+  const turnUrls = parseCommaSeparatedList(process.env.SHADOW_CHAT_TURN_URLS);
+  const turnUsername = String(process.env.SHADOW_CHAT_TURN_USERNAME ?? "").trim();
+  const turnCredential = String(process.env.SHADOW_CHAT_TURN_CREDENTIAL ?? "").trim();
+  const iceServers = [];
+
+  const resolvedStun = stunServers.length > 0 ? stunServers : fallbackStun;
+  iceServers.push({
+    urls: resolvedStun.length === 1 ? resolvedStun[0] : resolvedStun
+  });
+
+  if (turnUrls.length > 0) {
+    const turnEntry = {
+      urls: turnUrls.length === 1 ? turnUrls[0] : turnUrls
+    };
+
+    if (turnUsername) {
+      turnEntry.username = turnUsername.slice(0, 256);
+    }
+
+    if (turnCredential) {
+      turnEntry.credential = turnCredential.slice(0, 512);
+    }
+
+    iceServers.push(turnEntry);
+  }
+
+  return iceServers;
+}
+
+function parseRuntimeIceTransportPolicy() {
+  const raw = String(process.env.SHADOW_CHAT_ICE_TRANSPORT_POLICY ?? "")
+    .trim()
+    .toLowerCase();
+
+  if (raw === "relay" || raw === "all") {
+    return raw;
+  }
+
+  return "all";
+}
+
+const runtimeClientConfig = {
+  tenorApiKey: String(process.env.SHADOW_CHAT_TENOR_KEY ?? "").trim(),
+  iceServers: parseRuntimeIceServers(),
+  iceTransportPolicy: parseRuntimeIceTransportPolicy()
+};
+
+app.get("/runtime-config.js", (_request, response) => {
+  response.set("Cache-Control", "no-store");
+  response.type("application/javascript; charset=utf-8");
+  const payload = JSON.stringify(runtimeClientConfig).replace(/</g, "\\u003c");
+  response.send(`window.SHADOW_CHAT_RUNTIME = ${payload};\n`);
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 
 const users = new Map();
@@ -311,8 +440,14 @@ function normalizeChatWallpaper(value) {
     return raw;
   }
 
+  let candidate = raw;
+
+  if (!/^https?:\/\//i.test(candidate) && /^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
   try {
-    const parsed = new URL(raw);
+    const parsed = new URL(candidate);
 
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
       return parsed.toString();
@@ -4020,25 +4155,61 @@ io.on("connection", (socket) => {
       nextPrefs.wallpaper = wallpaper;
     }
 
-    const normalizedNext = normalizeViewerChatPreference(nextPrefs);
-    const normalizedCurrent = normalizeViewerChatPreference(currentPrefs);
-    const nextSerialized = JSON.stringify(normalizedNext ?? null);
-    const currentSerialized = JSON.stringify(normalizedCurrent ?? null);
+    const shouldShareStyle = hasTheme || hasWallpaper;
+    const targetUsers = shouldShareStyle ? chat.participants : [currentUser];
+    let changed = false;
+    let responsePrefs = normalizeViewerChatPreference(nextPrefs);
 
-    if (nextSerialized === currentSerialized) {
-      safeAck(callback, { ok: true, prefs: normalizedNext ?? null });
-      return;
+    for (const userKey of targetUsers) {
+      const userCurrentPrefs = viewerChatPreferencesForUser(chat, userKey);
+      const userNextPrefs = {
+        nickname: userCurrentPrefs.nickname,
+        theme: userCurrentPrefs.theme,
+        wallpaper: userCurrentPrefs.wallpaper
+      };
+
+      if (userKey === currentUser && hasNickname) {
+        userNextPrefs.nickname = nextPrefs.nickname;
+      }
+
+      if (hasTheme) {
+        userNextPrefs.theme = nextPrefs.theme;
+      }
+
+      if (hasWallpaper) {
+        userNextPrefs.wallpaper = nextPrefs.wallpaper;
+      }
+
+      const normalizedViewerCurrent = normalizeViewerChatPreference(userCurrentPrefs);
+      const normalizedViewerNext = normalizeViewerChatPreference(userNextPrefs);
+      const currentSerialized = JSON.stringify(normalizedViewerCurrent ?? null);
+      const nextSerialized = JSON.stringify(normalizedViewerNext ?? null);
+
+      if (userKey === currentUser) {
+        responsePrefs = normalizedViewerNext ?? null;
+      }
+
+      if (currentSerialized === nextSerialized) {
+        continue;
+      }
+
+      changed = true;
+
+      if (normalizedViewerNext) {
+        chat.viewerPrefs.set(userKey, normalizedViewerNext);
+      } else {
+        chat.viewerPrefs.delete(userKey);
+      }
     }
 
-    if (normalizedNext) {
-      chat.viewerPrefs.set(currentUser, normalizedNext);
-    } else {
-      chat.viewerPrefs.delete(currentUser);
+    if (!changed) {
+      safeAck(callback, { ok: true, prefs: responsePrefs ?? null });
+      return;
     }
 
     scheduleStatePersistence();
     emitChatState(chat);
-    safeAck(callback, { ok: true, prefs: normalizedNext ?? null });
+    safeAck(callback, { ok: true, prefs: responsePrefs ?? null });
   });
 
   socket.on("toggle_reaction", (payload, callback) => {
