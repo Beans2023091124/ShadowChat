@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,9 +32,21 @@ const MAX_ATTACHMENT_COUNT = 4;
 const MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024;
 const MAX_DATA_URL_LENGTH = 7_000_000;
 const MAX_AVATAR_DATA_URL_LENGTH = 2_500_000;
+const MAX_CHAT_NICKNAME_LENGTH = 48;
+const MAX_CHAT_WALLPAPER_LENGTH = 2048;
 const MAX_CALL_CHAT_LENGTH = 500;
 const MAX_CALL_CHAT_MESSAGES = 160;
 const MAX_GROUP_MEMBER_ADDS_PER_ACTION = 8;
+const MAX_LINK_PREVIEW_URL_LENGTH = 2048;
+const MAX_LINK_PREVIEW_TITLE_LENGTH = 140;
+const MAX_LINK_PREVIEW_DESCRIPTION_LENGTH = 240;
+const MAX_LINK_PREVIEW_SITE_NAME_LENGTH = 80;
+const MAX_LINK_PREVIEW_AUTHOR_LENGTH = 80;
+const LINK_PREVIEW_FETCH_TIMEOUT_MS = 4500;
+const LINK_PREVIEW_MAX_REDIRECTS = 3;
+const LINK_PREVIEW_MAX_HTML_BYTES = 220_000;
+const LINK_PREVIEW_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const CHAT_THEMES = new Set(["default", "slate", "forest", "sunset", "night"]);
 const DATA_DIR = process.env.SHADOW_CHAT_DATA_DIR
   ? path.resolve(process.env.SHADOW_CHAT_DATA_DIR)
   : path.join(__dirname, "data");
@@ -43,6 +56,7 @@ const DB_PATH = process.env.SHADOW_CHAT_DB_PATH
 const STATE_SNAPSHOT_PATH = process.env.SHADOW_CHAT_STATE_PATH
   ? path.resolve(process.env.SHADOW_CHAT_STATE_PATH)
   : path.join(DATA_DIR, "shadow-chat-state.json");
+const STATE_ENCRYPTION_SECRET = String(process.env.SHADOW_CHAT_STATE_ENCRYPTION_KEY ?? "");
 
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -52,7 +66,12 @@ const socketToUser = new Map();
 const chats = new Map();
 const activeCalls = new Map();
 const sessions = new Map();
+const sessionDetails = new Map();
+const socketToSession = new Map();
+const sessionToSockets = new Map();
 const sessionsByUser = new Map();
+const linkPreviewCache = new Map();
+const linkPreviewRequests = new Map();
 let persistenceScheduled = false;
 
 let persistenceBackend = "json";
@@ -123,11 +142,201 @@ function cleanPassword(value) {
   return String(value ?? "").slice(0, 64);
 }
 
+const PASSWORD_HASH_BYTES = 64;
+const PASSWORD_SALT_BYTES = 16;
+const ENCRYPTED_STATE_PREFIX = "enc:v1";
+const stateEncryptionKey = STATE_ENCRYPTION_SECRET
+  ? crypto.createHash("sha256").update(STATE_ENCRYPTION_SECRET).digest()
+  : null;
+
+function hashPassword(password, salt = crypto.randomBytes(PASSWORD_SALT_BYTES).toString("hex")) {
+  const passwordHash = crypto.scryptSync(password, salt, PASSWORD_HASH_BYTES).toString("hex");
+  return {
+    passwordSalt: salt,
+    passwordHash
+  };
+}
+
+function setUserPassword(user, password) {
+  const { passwordSalt, passwordHash } = hashPassword(password);
+  user.passwordSalt = passwordSalt;
+  user.passwordHash = passwordHash;
+  delete user.password;
+}
+
+function isHashedPassword(user) {
+  return Boolean(
+    user &&
+      typeof user.passwordHash === "string" &&
+      typeof user.passwordSalt === "string" &&
+      /^[a-f0-9]{128}$/i.test(user.passwordHash) &&
+      /^[a-f0-9]{32}$/i.test(user.passwordSalt)
+  );
+}
+
+function verifyUserPassword(user, password) {
+  if (!user || !password) {
+    return false;
+  }
+
+  if (isHashedPassword(user)) {
+    try {
+      const candidateHash = crypto.scryptSync(password, user.passwordSalt, PASSWORD_HASH_BYTES).toString(
+        "hex"
+      );
+      const candidateBuffer = Buffer.from(candidateHash, "hex");
+      const storedBuffer = Buffer.from(user.passwordHash, "hex");
+
+      if (candidateBuffer.length !== storedBuffer.length) {
+        return false;
+      }
+
+      return crypto.timingSafeEqual(candidateBuffer, storedBuffer);
+    } catch {
+      return false;
+    }
+  }
+
+  return cleanPassword(user.password) === password;
+}
+
+function maybeMigrateLegacyPassword(user) {
+  if (!user || isHashedPassword(user)) {
+    return false;
+  }
+
+  const legacyPassword = cleanPassword(user.password);
+  if (legacyPassword.length < 4) {
+    return false;
+  }
+
+  setUserPassword(user, legacyPassword);
+  return true;
+}
+
+function encryptStatePayload(serializedState) {
+  if (!stateEncryptionKey) {
+    return serializedState;
+  }
+
+  try {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", stateEncryptionKey, iv);
+    const encrypted = Buffer.concat([cipher.update(serializedState, "utf8"), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+
+    return [
+      ENCRYPTED_STATE_PREFIX,
+      iv.toString("base64"),
+      authTag.toString("base64"),
+      encrypted.toString("base64")
+    ].join(":");
+  } catch (error) {
+    console.error("Failed to encrypt state for persistence:", error);
+    return null;
+  }
+}
+
+function decryptStatePayload(storedValue) {
+  const rawValue = String(storedValue ?? "");
+  const prefix = `${ENCRYPTED_STATE_PREFIX}:`;
+
+  if (!rawValue.startsWith(prefix)) {
+    return rawValue;
+  }
+
+  if (!stateEncryptionKey) {
+    console.error(
+      "Encrypted state detected, but SHADOW_CHAT_STATE_ENCRYPTION_KEY is not set. State restore was skipped."
+    );
+    return null;
+  }
+
+  const segments = rawValue.split(":");
+  if (segments.length !== 4) {
+    console.error("Encrypted state format is invalid and was ignored.");
+    return null;
+  }
+
+  const [, ivBase64, authTagBase64, encryptedBase64] = segments;
+
+  try {
+    const iv = Buffer.from(ivBase64, "base64");
+    const authTag = Buffer.from(authTagBase64, "base64");
+    const encrypted = Buffer.from(encryptedBase64, "base64");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", stateEncryptionKey, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    return decrypted.toString("utf8");
+  } catch (error) {
+    console.error("Failed to decrypt persisted state. Check SHADOW_CHAT_STATE_ENCRYPTION_KEY.", error);
+    return null;
+  }
+}
+
 function cleanAlias(value) {
   return String(value ?? "")
     .trim()
     .replace(/\s+/g, " ")
     .slice(0, 24);
+}
+
+function cleanChatNickname(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, MAX_CHAT_NICKNAME_LENGTH);
+}
+
+function normalizeChatTheme(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+
+  return CHAT_THEMES.has(normalized) ? normalized : "default";
+}
+
+function normalizeChatWallpaper(value) {
+  const raw = String(value ?? "").trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  if (raw.length > MAX_CHAT_WALLPAPER_LENGTH) {
+    return null;
+  }
+
+  if (raw.startsWith("data:image/")) {
+    return raw;
+  }
+
+  try {
+    const parsed = new URL(raw);
+
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return parsed.toString();
+    }
+  } catch {}
+
+  return null;
+}
+
+function normalizeViewerChatPreference(rawValue) {
+  const source = rawValue && typeof rawValue === "object" ? rawValue : {};
+  const nickname = cleanChatNickname(source.nickname);
+  const theme = normalizeChatTheme(source.theme);
+  const wallpaper = normalizeChatWallpaper(source.wallpaper);
+
+  if (!nickname && theme === "default" && !wallpaper) {
+    return null;
+  }
+
+  return {
+    nickname: nickname || null,
+    theme,
+    wallpaper: wallpaper || null
+  };
 }
 
 function cleanFileName(value) {
@@ -138,6 +347,886 @@ function cleanFileName(value) {
     .slice(0, 80);
 
   return cleaned || fallback;
+}
+
+function decodeHtmlEntities(value) {
+  return String(value ?? "").replace(
+    /&(#\d+|#x[0-9a-f]+|[a-z]+);/gi,
+    (match, entityRaw) => {
+      const entity = String(entityRaw ?? "").toLowerCase();
+
+      if (entity === "amp") {
+        return "&";
+      }
+      if (entity === "lt") {
+        return "<";
+      }
+      if (entity === "gt") {
+        return ">";
+      }
+      if (entity === "quot") {
+        return "\"";
+      }
+      if (entity === "apos" || entity === "#39") {
+        return "'";
+      }
+      if (entity.startsWith("#x")) {
+        const codePoint = Number.parseInt(entity.slice(2), 16);
+        if (!Number.isFinite(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
+          return match;
+        }
+        return String.fromCodePoint(codePoint);
+      }
+      if (entity.startsWith("#")) {
+        const codePoint = Number.parseInt(entity.slice(1), 10);
+        if (!Number.isFinite(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
+          return match;
+        }
+        return String.fromCodePoint(codePoint);
+      }
+
+      return match;
+    }
+  );
+}
+
+function cleanLinkPreviewText(value, maxLength) {
+  const normalized = decodeHtmlEntities(String(value ?? ""))
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized.slice(0, Math.max(1, Number(maxLength) || 120));
+}
+
+function trimUrlToken(rawToken) {
+  let token = String(rawToken ?? "");
+
+  while (token.length > 0 && /[),.!?:;]$/.test(token)) {
+    token = token.slice(0, -1);
+  }
+
+  return token;
+}
+
+function isPrivateOrDisallowedHostname(hostname) {
+  const host = String(hostname ?? "").trim().toLowerCase();
+
+  if (!host) {
+    return true;
+  }
+
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".home") ||
+    host.endsWith(".lan")
+  ) {
+    return true;
+  }
+
+  const ipv6ZoneStripped = host.includes("%") ? host.slice(0, host.indexOf("%")) : host;
+  const ipVersion = net.isIP(ipv6ZoneStripped);
+
+  if (ipVersion === 6) {
+    if (
+      ipv6ZoneStripped === "::1" ||
+      ipv6ZoneStripped.startsWith("fe80:") ||
+      ipv6ZoneStripped.startsWith("fc") ||
+      ipv6ZoneStripped.startsWith("fd")
+    ) {
+      return true;
+    }
+
+    if (ipv6ZoneStripped.startsWith("::ffff:")) {
+      return isPrivateOrDisallowedHostname(ipv6ZoneStripped.slice(7));
+    }
+
+    return false;
+  }
+
+  if (ipVersion === 4) {
+    const octets = ipv6ZoneStripped.split(".").map((part) => Number.parseInt(part, 10));
+
+    if (octets.length !== 4 || octets.some((part) => !Number.isFinite(part) || part < 0 || part > 255)) {
+      return true;
+    }
+
+    const [a, b] = octets;
+
+    if (a === 0 || a === 10 || a === 127) {
+      return true;
+    }
+
+    if (a === 169 && b === 254) {
+      return true;
+    }
+
+    if (a === 172 && b >= 16 && b <= 31) {
+      return true;
+    }
+
+    if (a === 192 && b === 168) {
+      return true;
+    }
+
+    if (a === 100 && b >= 64 && b <= 127) {
+      return true;
+    }
+
+    if (a === 198 && (b === 18 || b === 19)) {
+      return true;
+    }
+
+    if (a >= 224) {
+      return true;
+    }
+
+    return false;
+  }
+
+  return !host.includes(".");
+}
+
+function normalizeHttpUrl(rawValue) {
+  const raw = String(rawValue ?? "").trim();
+
+  if (!raw || raw.length > MAX_LINK_PREVIEW_URL_LENGTH) {
+    return null;
+  }
+
+  const prefixed = raw.startsWith("www.") ? `https://${raw}` : raw;
+
+  try {
+    const parsed = new URL(prefixed);
+
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+
+    if (isPrivateOrDisallowedHostname(parsed.hostname)) {
+      return null;
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function firstPreviewUrlFromText(textValue) {
+  const text = String(textValue ?? "");
+  const urlPattern = /\b((https?:\/\/|www\.)[^\s]+)/gi;
+  let match;
+
+  while ((match = urlPattern.exec(text)) !== null) {
+    const token = trimUrlToken(match[0]);
+    const normalized = normalizeHttpUrl(token);
+
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return null;
+}
+
+function normalizePreviewCacheLabel(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/+$/, "");
+}
+
+function previewProviderKeyFromHostname(hostname) {
+  const host = String(hostname ?? "").trim().toLowerCase();
+
+  if (!host) {
+    return "website";
+  }
+
+  if (
+    host === "youtu.be" ||
+    host === "youtube.com" ||
+    host.endsWith(".youtube.com")
+  ) {
+    return "youtube";
+  }
+
+  if (host === "twitter.com" || host === "x.com" || host.endsWith(".x.com")) {
+    return "twitter";
+  }
+
+  if (host === "github.com" || host.endsWith(".github.com")) {
+    return "github";
+  }
+
+  if (
+    host === "tiktok.com" ||
+    host.endsWith(".tiktok.com") ||
+    host === "vm.tiktok.com" ||
+    host === "vt.tiktok.com"
+  ) {
+    return "tiktok";
+  }
+
+  return "website";
+}
+
+function isYouTubeUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl ?? ""));
+    const provider = previewProviderKeyFromHostname(parsed.hostname);
+    return provider === "youtube";
+  } catch {
+    return false;
+  }
+}
+
+function isTikTokUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl ?? ""));
+    const provider = previewProviderKeyFromHostname(parsed.hostname);
+    return provider === "tiktok";
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeLinkPreview(rawPreview) {
+  if (!rawPreview || typeof rawPreview !== "object") {
+    return null;
+  }
+
+  const normalizedUrl = normalizeHttpUrl(rawPreview.url);
+
+  if (!normalizedUrl) {
+    return null;
+  }
+
+  const parsedUrl = new URL(normalizedUrl);
+  const title =
+    cleanLinkPreviewText(rawPreview.title, MAX_LINK_PREVIEW_TITLE_LENGTH) || parsedUrl.hostname;
+  const description = cleanLinkPreviewText(
+    rawPreview.description,
+    MAX_LINK_PREVIEW_DESCRIPTION_LENGTH
+  );
+  const siteName = cleanLinkPreviewText(rawPreview.siteName, MAX_LINK_PREVIEW_SITE_NAME_LENGTH);
+  const imageUrl = normalizeHttpUrl(rawPreview.imageUrl);
+  const authorName = cleanLinkPreviewText(rawPreview.authorName, MAX_LINK_PREVIEW_AUTHOR_LENGTH);
+  const providerKey = previewProviderKeyFromHostname(parsedUrl.hostname);
+
+  return {
+    url: normalizedUrl,
+    title,
+    description: description || null,
+    siteName: siteName || parsedUrl.hostname,
+    imageUrl: imageUrl || null,
+    authorName: authorName || null,
+    providerKey
+  };
+}
+
+function isWeakVideoPreview(rawPreview) {
+  const preview = sanitizeLinkPreview(rawPreview);
+
+  if (!preview) {
+    return true;
+  }
+
+  const provider = String(preview.providerKey ?? "").trim().toLowerCase();
+
+  if (provider !== "youtube" && provider !== "tiktok") {
+    return false;
+  }
+
+  let hostLabel = "";
+
+  try {
+    hostLabel = new URL(preview.url).hostname;
+  } catch {}
+
+  const normalizedTitle = normalizePreviewCacheLabel(preview.title);
+  const normalizedHost = normalizePreviewCacheLabel(hostLabel);
+  const normalizedSite = normalizePreviewCacheLabel(preview.siteName);
+  const missingAuthor = !String(preview.authorName ?? "").trim();
+  const lowQualityTitle =
+    !normalizedTitle ||
+    normalizedTitle === normalizedHost ||
+    normalizedTitle === normalizedSite ||
+    normalizedTitle === "youtube" ||
+    normalizedTitle === "tiktok";
+
+  return missingAuthor || lowQualityTitle;
+}
+
+function parseMetaAttributes(tag) {
+  const attributes = {};
+  const attributePattern = /([a-zA-Z:-]+)\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+  let match;
+
+  while ((match = attributePattern.exec(tag)) !== null) {
+    const key = String(match[1] ?? "").trim().toLowerCase();
+    const value = String(match[3] ?? match[4] ?? match[5] ?? "").trim();
+
+    if (key) {
+      attributes[key] = value;
+    }
+  }
+
+  return attributes;
+}
+
+function extractPreviewMetadata(html) {
+  const source = String(html ?? "");
+  const metadata = {};
+  const metaTagPattern = /<meta\s+[^>]*>/gi;
+  let tagMatch;
+
+  while ((tagMatch = metaTagPattern.exec(source)) !== null) {
+    const tag = String(tagMatch[0] ?? "");
+    const attributes = parseMetaAttributes(tag);
+    const key = String(attributes.property ?? attributes.name ?? attributes.itemprop ?? "")
+      .trim()
+      .toLowerCase();
+    const content = String(attributes.content ?? "").trim();
+
+    if (!key || !content || metadata[key]) {
+      continue;
+    }
+
+    metadata[key] = content;
+  }
+
+  const titleMatch = source.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const titleFromTag = titleMatch ? cleanLinkPreviewText(titleMatch[1], MAX_LINK_PREVIEW_TITLE_LENGTH) : "";
+
+  return {
+    title: metadata["og:title"] || metadata["twitter:title"] || titleFromTag,
+    description:
+      metadata["og:description"] || metadata["twitter:description"] || metadata.description || "",
+    siteName: metadata["og:site_name"] || "",
+    imageUrl: metadata["og:image"] || metadata["twitter:image"] || "",
+    author: metadata.author || metadata["twitter:creator"] || metadata["og:video:tag"] || ""
+  };
+}
+
+async function fetchYouTubeOEmbedPreview(url, signal) {
+  const normalizedUrl = normalizeHttpUrl(url);
+
+  if (!normalizedUrl || !isYouTubeUrl(normalizedUrl)) {
+    return null;
+  }
+
+  try {
+    const endpoint = new URL("https://www.youtube.com/oembed");
+    endpoint.searchParams.set("url", normalizedUrl);
+    endpoint.searchParams.set("format", "json");
+
+    const response = await fetch(endpoint, {
+      method: "GET",
+      redirect: "follow",
+      signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (compatible; ShadowChatLinkPreview/1.0; +https://shadow-chat.site)"
+      }
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+
+    return sanitizeLinkPreview({
+      url: normalizedUrl,
+      title: String(payload?.title ?? "").trim(),
+      description: "",
+      siteName: String(payload?.provider_name ?? "YouTube").trim() || "YouTube",
+      imageUrl: String(payload?.thumbnail_url ?? "").trim(),
+      authorName: String(payload?.author_name ?? "").trim(),
+      providerKey: "youtube"
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function fetchTikTokOEmbedPreview(url, signal) {
+  const normalizedUrl = normalizeHttpUrl(url);
+
+  if (!normalizedUrl || !isTikTokUrl(normalizedUrl)) {
+    return null;
+  }
+
+  try {
+    const endpoint = new URL("https://www.tiktok.com/oembed");
+    endpoint.searchParams.set("url", normalizedUrl);
+
+    const response = await fetch(endpoint, {
+      method: "GET",
+      redirect: "follow",
+      signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (compatible; ShadowChatLinkPreview/1.0; +https://shadow-chat.site)"
+      }
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+    const html = String(payload?.html ?? "");
+    const citeMatch = html.match(/cite=["']([^"']+)["']/i);
+    const htmlUrlMatch = html.match(/https?:\/\/(?:www\.)?tiktok\.com\/[^"'<> ]+\/video\/\d+/i);
+    const embedProductId = String(payload?.embed_product_id ?? "").trim();
+    const rawAuthorName = String(payload?.author_name ?? "").trim();
+    let normalizedAuthorName =
+      rawAuthorName && !rawAuthorName.startsWith("@") ? `@${rawAuthorName}` : rawAuthorName;
+    let canonicalUrl = normalizedUrl;
+
+    if (citeMatch && citeMatch[1]) {
+      const normalizedCite = normalizeHttpUrl(citeMatch[1]);
+      if (normalizedCite) {
+        canonicalUrl = normalizedCite;
+      }
+    } else if (htmlUrlMatch && htmlUrlMatch[0]) {
+      const normalizedFromHtml = normalizeHttpUrl(htmlUrlMatch[0]);
+      if (normalizedFromHtml) {
+        canonicalUrl = normalizedFromHtml;
+      }
+    } else if (/^\d{6,}$/.test(embedProductId)) {
+      canonicalUrl = `https://www.tiktok.com/@_/video/${embedProductId}`;
+    }
+
+    if (!normalizedAuthorName) {
+      const usernameMatch = canonicalUrl.match(/(?:www\.)?tiktok\.com\/(@[^/?#]+)/i);
+
+      if (usernameMatch && usernameMatch[1]) {
+        normalizedAuthorName = String(usernameMatch[1]).trim();
+      }
+    }
+
+    return sanitizeLinkPreview({
+      url: canonicalUrl,
+      title: String(payload?.title ?? "").trim(),
+      description: "",
+      siteName: String(payload?.provider_name ?? "TikTok").trim() || "TikTok",
+      imageUrl: String(payload?.thumbnail_url ?? "").trim(),
+      authorName: normalizedAuthorName,
+      providerKey: "tiktok"
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function readResponseTextWithLimit(response, maxBytes) {
+  const maxLength = Math.max(1024, Number(maxBytes) || LINK_PREVIEW_MAX_HTML_BYTES);
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const text = await response.text();
+    return text.slice(0, maxLength);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytesRead = 0;
+  let done = false;
+
+  while (!done) {
+    const chunk = await reader.read();
+    done = chunk.done === true;
+
+    if (done) {
+      break;
+    }
+
+    const value = chunk.value instanceof Uint8Array ? chunk.value : new Uint8Array();
+    bytesRead += value.byteLength;
+
+    if (bytesRead > maxLength) {
+      const allowed = Math.max(0, value.byteLength - (bytesRead - maxLength));
+
+      if (allowed > 0) {
+        text += decoder.decode(value.slice(0, allowed), { stream: true });
+      }
+
+      try {
+        await reader.cancel();
+      } catch {}
+      break;
+    }
+
+    text += decoder.decode(value, { stream: true });
+  }
+
+  text += decoder.decode();
+  return text;
+}
+
+async function fetchPreviewResponseWithRedirects(initialUrl, signal) {
+  let url = normalizeHttpUrl(initialUrl);
+
+  if (!url) {
+    return null;
+  }
+
+  const headers = {
+    "user-agent":
+      "Mozilla/5.0 (compatible; ShadowChatLinkPreview/1.0; +https://shadow-chat.site)"
+  };
+
+  for (let redirectCount = 0; redirectCount <= LINK_PREVIEW_MAX_REDIRECTS; redirectCount += 1) {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "manual",
+      signal,
+      headers
+    });
+
+    const status = Number(response.status);
+
+    if (status >= 300 && status < 400) {
+      const location = String(response.headers.get("location") ?? "").trim();
+
+      if (!location) {
+        return null;
+      }
+
+      const redirected = normalizeHttpUrl(new URL(location, url).toString());
+
+      if (!redirected) {
+        return null;
+      }
+
+      url = redirected;
+      continue;
+    }
+
+    if (status < 200 || status >= 300) {
+      return null;
+    }
+
+    const resolvedUrl = normalizeHttpUrl(response.url || url);
+
+    if (!resolvedUrl) {
+      return null;
+    }
+
+    return {
+      response,
+      resolvedUrl
+    };
+  }
+
+  return null;
+}
+
+function getCachedLinkPreview(url) {
+  const key = String(url ?? "").trim();
+
+  if (!key) {
+    return { hit: false, preview: null };
+  }
+
+  const entry = linkPreviewCache.get(key);
+
+  if (!entry) {
+    return { hit: false, preview: null };
+  }
+
+  if (Number(entry.expiresAt ?? 0) <= Date.now()) {
+    linkPreviewCache.delete(key);
+    return { hit: false, preview: null };
+  }
+
+  return {
+    hit: true,
+    preview: entry.preview ? { ...entry.preview } : null
+  };
+}
+
+function setCachedLinkPreview(url, preview) {
+  const key = String(url ?? "").trim();
+
+  if (!key) {
+    return;
+  }
+
+  linkPreviewCache.set(key, {
+    preview: preview ? { ...preview } : null,
+    expiresAt: Date.now() + LINK_PREVIEW_CACHE_TTL_MS
+  });
+
+  if (linkPreviewCache.size <= 800) {
+    return;
+  }
+
+  const oldestKey = linkPreviewCache.keys().next().value;
+
+  if (oldestKey) {
+    linkPreviewCache.delete(oldestKey);
+  }
+}
+
+async function fetchLinkPreview(url) {
+  const normalizedUrl = normalizeHttpUrl(url);
+
+  if (!normalizedUrl) {
+    return null;
+  }
+
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => {
+    timeoutController.abort();
+  }, LINK_PREVIEW_FETCH_TIMEOUT_MS);
+
+  try {
+    if (isYouTubeUrl(normalizedUrl)) {
+      const youtubePreview = await fetchYouTubeOEmbedPreview(
+        normalizedUrl,
+        timeoutController.signal
+      );
+
+      if (youtubePreview) {
+        return youtubePreview;
+      }
+    }
+
+    if (isTikTokUrl(normalizedUrl)) {
+      const tiktokPreview = await fetchTikTokOEmbedPreview(
+        normalizedUrl,
+        timeoutController.signal
+      );
+
+      if (tiktokPreview) {
+        return tiktokPreview;
+      }
+    }
+
+    const responseBundle = await fetchPreviewResponseWithRedirects(
+      normalizedUrl,
+      timeoutController.signal
+    );
+
+    if (!responseBundle) {
+      return null;
+    }
+
+    const { response, resolvedUrl } = responseBundle;
+    const contentType = String(response.headers.get("content-type") ?? "").toLowerCase();
+
+    if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+      return null;
+    }
+
+    const html = await readResponseTextWithLimit(response, LINK_PREVIEW_MAX_HTML_BYTES);
+    const extracted = extractPreviewMetadata(html);
+    const resolved = new URL(resolvedUrl);
+    const siteName =
+      cleanLinkPreviewText(extracted.siteName, MAX_LINK_PREVIEW_SITE_NAME_LENGTH) || resolved.hostname;
+    const title =
+      cleanLinkPreviewText(extracted.title, MAX_LINK_PREVIEW_TITLE_LENGTH) || resolved.hostname;
+    const description = cleanLinkPreviewText(
+      extracted.description,
+      MAX_LINK_PREVIEW_DESCRIPTION_LENGTH
+    );
+    let imageUrl = "";
+
+    if (extracted.imageUrl) {
+      try {
+        imageUrl = new URL(extracted.imageUrl, resolvedUrl).toString();
+      } catch {
+        imageUrl = "";
+      }
+    }
+
+    return sanitizeLinkPreview({
+      url: resolvedUrl,
+      title,
+      description,
+      siteName,
+      imageUrl,
+      authorName: extracted.author
+    });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function resolveLinkPreview(url) {
+  const normalizedUrl = normalizeHttpUrl(url);
+
+  if (!normalizedUrl) {
+    return null;
+  }
+
+  const cached = getCachedLinkPreview(normalizedUrl);
+
+  if (cached.hit) {
+    return cached.preview;
+  }
+
+  const existingRequest = linkPreviewRequests.get(normalizedUrl);
+
+  if (existingRequest) {
+    return existingRequest;
+  }
+
+  const request = fetchLinkPreview(normalizedUrl)
+    .then((preview) => {
+      setCachedLinkPreview(normalizedUrl, preview);
+      return preview;
+    })
+    .catch(() => {
+      setCachedLinkPreview(normalizedUrl, null);
+      return null;
+    })
+    .finally(() => {
+      linkPreviewRequests.delete(normalizedUrl);
+    });
+
+  linkPreviewRequests.set(normalizedUrl, request);
+  return request;
+}
+
+function linkPreviewForText(textValue) {
+  const previewUrl = firstPreviewUrlFromText(textValue);
+
+  if (!previewUrl) {
+    return {
+      previewUrl: null,
+      preview: null,
+      cacheHit: false
+    };
+  }
+
+  const cacheResult = getCachedLinkPreview(previewUrl);
+  const cachedPreview = cacheResult.preview;
+  const shouldRefetch = cacheResult.hit && isWeakVideoPreview(cachedPreview);
+  const preview = shouldRefetch ? null : cachedPreview;
+
+  return {
+    previewUrl,
+    preview,
+    cacheHit: cacheResult.hit && !shouldRefetch
+  };
+}
+
+function weakVideoPreviewCandidates(chat, limit = 3) {
+  if (!chat || !Array.isArray(chat.messages) || chat.messages.length === 0) {
+    return [];
+  }
+
+  const maxCount = Math.max(1, Math.min(8, Number(limit) || 3));
+  const candidates = [];
+
+  for (
+    let messageIndex = chat.messages.length - 1;
+    messageIndex >= 0 && candidates.length < maxCount;
+    messageIndex -= 1
+  ) {
+    const message = chat.messages[messageIndex];
+
+    if (!message || message.deleted) {
+      continue;
+    }
+
+    const previewUrl = firstPreviewUrlFromText(message.text);
+
+    if (!previewUrl) {
+      continue;
+    }
+
+    if (!isYouTubeUrl(previewUrl) && !isTikTokUrl(previewUrl)) {
+      continue;
+    }
+
+    if (!isWeakVideoPreview(message.linkPreview)) {
+      continue;
+    }
+
+    candidates.push({
+      messageId: message.id,
+      previewUrl
+    });
+  }
+
+  return candidates;
+}
+
+function hydrateWeakVideoPreviewsForChat(chat, limit = 3) {
+  const candidates = weakVideoPreviewCandidates(chat, limit);
+
+  for (const candidate of candidates) {
+    hydrateMessageLinkPreview(chat.id, candidate.messageId, candidate.previewUrl).catch(() => {});
+  }
+}
+
+async function hydrateMessageLinkPreview(chatId, messageId, expectedUrl) {
+  const normalizedExpectedUrl = normalizeHttpUrl(expectedUrl);
+
+  if (!chatId || !messageId || !normalizedExpectedUrl) {
+    return;
+  }
+
+  const preview = await resolveLinkPreview(normalizedExpectedUrl);
+
+  if (!preview) {
+    return;
+  }
+
+  const chat = chats.get(chatId);
+
+  if (!chat) {
+    return;
+  }
+
+  const message = chat.messages.find((entry) => entry.id === messageId);
+
+  if (!message || message.deleted) {
+    return;
+  }
+
+  const currentUrl = firstPreviewUrlFromText(message.text);
+
+  if (!currentUrl || currentUrl !== normalizedExpectedUrl) {
+    return;
+  }
+
+  const currentPreview = sanitizeLinkPreview(message.linkPreview);
+
+  if (
+    currentPreview &&
+    currentPreview.url === preview.url &&
+    currentPreview.title === preview.title &&
+    currentPreview.description === preview.description &&
+    currentPreview.siteName === preview.siteName &&
+    currentPreview.imageUrl === preview.imageUrl &&
+    currentPreview.authorName === preview.authorName &&
+    currentPreview.providerKey === preview.providerKey
+  ) {
+    return;
+  }
+
+  message.linkPreview = preview;
+  scheduleStatePersistence();
+  emitChatState(chat);
 }
 
 function safeAck(callback, payload) {
@@ -155,6 +1244,284 @@ function isValidIsoDate(value) {
 
   const timestamp = Date.parse(iso);
   return Number.isFinite(timestamp);
+}
+
+function cleanSessionDeviceName(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 64);
+}
+
+function cleanSessionUserAgent(value) {
+  return String(value ?? "").trim().slice(0, 300);
+}
+
+function cleanSessionIpAddress(value) {
+  return String(value ?? "").trim().slice(0, 100);
+}
+
+function isLoopbackIp(value) {
+  const ip = String(value ?? "").trim().toLowerCase();
+
+  if (!ip) {
+    return false;
+  }
+
+  return (
+    ip === "::1" ||
+    ip === "127.0.0.1" ||
+    ip === "localhost" ||
+    ip === "::ffff:127.0.0.1"
+  );
+}
+
+function normalizeIpCandidate(value) {
+  let candidate = String(value ?? "").trim();
+
+  if (!candidate) {
+    return "";
+  }
+
+  if (
+    candidate.startsWith("\"") &&
+    candidate.endsWith("\"") &&
+    candidate.length >= 2
+  ) {
+    candidate = candidate.slice(1, -1).trim();
+  }
+
+  if (
+    candidate.startsWith("'") &&
+    candidate.endsWith("'") &&
+    candidate.length >= 2
+  ) {
+    candidate = candidate.slice(1, -1).trim();
+  }
+
+  if (
+    candidate.startsWith("[") &&
+    candidate.includes("]") &&
+    candidate.indexOf("]") > 1
+  ) {
+    candidate = candidate.slice(1, candidate.indexOf("]")).trim();
+  } else {
+    const hasIpv4 = candidate.includes(".");
+    const hasSinglePortSuffix = /^[^:]+:\d+$/.test(candidate);
+
+    if (hasIpv4 && hasSinglePortSuffix) {
+      candidate = candidate.slice(0, candidate.lastIndexOf(":")).trim();
+    }
+  }
+
+  const lower = candidate.toLowerCase();
+
+  if (lower === "unknown" || lower === "null") {
+    return "";
+  }
+
+  if (lower.startsWith("::ffff:")) {
+    candidate = candidate.slice(7).trim();
+  }
+
+  return cleanSessionIpAddress(candidate);
+}
+
+function appendHeaderValues(target, value) {
+  if (typeof value === "string") {
+    target.push(value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (typeof entry === "string") {
+        target.push(entry);
+      }
+    }
+  }
+}
+
+function extractForwardedForCandidates(rawValue) {
+  const values = [];
+  appendHeaderValues(values, rawValue);
+
+  const candidates = [];
+
+  for (const value of values) {
+    for (const token of value.split(",")) {
+      const normalized = normalizeIpCandidate(token);
+
+      if (normalized) {
+        candidates.push(normalized);
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function extractForwardedHeaderCandidates(rawValue) {
+  const values = [];
+  appendHeaderValues(values, rawValue);
+
+  const candidates = [];
+
+  for (const value of values) {
+    for (const group of value.split(",")) {
+      for (const directive of group.split(";")) {
+        const trimmed = directive.trim();
+
+        if (!trimmed.toLowerCase().startsWith("for=")) {
+          continue;
+        }
+
+        const rawCandidate = trimmed.slice(4).trim();
+        const normalized = normalizeIpCandidate(rawCandidate);
+
+        if (normalized) {
+          candidates.push(normalized);
+        }
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function selectBestClientIp(candidates) {
+  let fallback = "";
+
+  for (const candidate of candidates) {
+    const normalized = normalizeIpCandidate(candidate);
+
+    if (!normalized) {
+      continue;
+    }
+
+    if (!fallback) {
+      fallback = normalized;
+    }
+
+    if (!isLoopbackIp(normalized)) {
+      return normalized;
+    }
+  }
+
+  return fallback;
+}
+
+function normalizeSessionTimestamp(value, fallbackIso) {
+  return isValidIsoDate(value) ? String(value) : fallbackIso;
+}
+
+function browserNameFromUserAgent(userAgent) {
+  const ua = userAgent.toLowerCase();
+
+  if (ua.includes("edg/")) {
+    return "Edge";
+  }
+
+  if (ua.includes("opr/") || ua.includes("opera")) {
+    return "Opera";
+  }
+
+  if (ua.includes("firefox/")) {
+    return "Firefox";
+  }
+
+  if (ua.includes("chrome/") || ua.includes("crios/")) {
+    return "Chrome";
+  }
+
+  if (ua.includes("safari/")) {
+    return "Safari";
+  }
+
+  return "Browser";
+}
+
+function osNameFromUserAgent(userAgent) {
+  const ua = userAgent.toLowerCase();
+
+  if (ua.includes("windows")) {
+    return "Windows";
+  }
+
+  if (ua.includes("android")) {
+    return "Android";
+  }
+
+  if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod")) {
+    return "iOS";
+  }
+
+  if (ua.includes("mac os x") || ua.includes("macintosh")) {
+    return "macOS";
+  }
+
+  if (ua.includes("linux")) {
+    return "Linux";
+  }
+
+  return "Unknown OS";
+}
+
+function inferSessionDeviceLabel(session) {
+  const explicit = cleanSessionDeviceName(session?.deviceName);
+
+  if (explicit) {
+    return explicit;
+  }
+
+  const userAgent = cleanSessionUserAgent(session?.userAgent);
+
+  if (!userAgent) {
+    return "Unknown device";
+  }
+
+  return `${osNameFromUserAgent(userAgent)} - ${browserNameFromUserAgent(userAgent)}`;
+}
+
+function socketClientIp(socket) {
+  const headers = socket?.handshake?.headers ?? {};
+  const candidates = [];
+
+  candidates.push(...extractForwardedForCandidates(headers["x-forwarded-for"]));
+  candidates.push(...extractForwardedHeaderCandidates(headers.forwarded));
+
+  appendHeaderValues(candidates, headers["cf-connecting-ip"]);
+  appendHeaderValues(candidates, headers["x-real-ip"]);
+  appendHeaderValues(candidates, headers["x-client-ip"]);
+  appendHeaderValues(candidates, headers["true-client-ip"]);
+  appendHeaderValues(candidates, headers["fastly-client-ip"]);
+  appendHeaderValues(candidates, headers["fly-client-ip"]);
+
+  appendHeaderValues(candidates, socket?.handshake?.address);
+  appendHeaderValues(candidates, socket?.conn?.remoteAddress);
+  appendHeaderValues(candidates, socket?.request?.socket?.remoteAddress);
+
+  return selectBestClientIp(candidates);
+}
+
+function buildSessionDetails(userKey, sessionId, socket, requestedDeviceName = "", previous = null) {
+  const nowIso = new Date().toISOString();
+  const previousCreatedAt = previous?.createdAt;
+
+  return {
+    sessionId,
+    userKey,
+    createdAt: normalizeSessionTimestamp(previousCreatedAt, nowIso),
+    lastSeenAt: nowIso,
+    deviceName: cleanSessionDeviceName(requestedDeviceName || previous?.deviceName),
+    userAgent: cleanSessionUserAgent(socket?.handshake?.headers?.["user-agent"] || previous?.userAgent),
+    ipAddress: socketClientIp(socket) || cleanSessionIpAddress(previous?.ipAddress)
+  };
+}
+
+function sessionTimeValue(isoDate) {
+  const timestamp = Date.parse(String(isoDate ?? ""));
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function normalizeUserList(rawUsers) {
@@ -190,6 +1557,11 @@ function sanitizeStoredMessage(rawMessage, participants) {
   for (const rawAttachment of rawAttachments) {
     const dataUrl = String(rawAttachment?.dataUrl ?? "");
     const size = Number(rawAttachment?.size ?? 0);
+    const durationSecondsRaw = Number(rawAttachment?.durationSeconds ?? NaN);
+    const durationSeconds =
+      Number.isFinite(durationSecondsRaw) && durationSecondsRaw > 0
+        ? Math.min(24 * 60 * 60, Math.round(durationSecondsRaw * 100) / 100)
+        : null;
 
     if (!dataUrl.startsWith("data:")) {
       continue;
@@ -204,7 +1576,8 @@ function sanitizeStoredMessage(rawMessage, participants) {
       name: cleanFileName(rawAttachment?.name),
       type: String(rawAttachment?.type ?? "application/octet-stream").slice(0, 100),
       size,
-      dataUrl
+      dataUrl,
+      durationSeconds
     });
   }
 
@@ -316,6 +1689,8 @@ function sanitizeStoredMessage(rawMessage, participants) {
     };
   }
 
+  const linkPreview = sanitizeLinkPreview(rawMessage?.linkPreview);
+
   return {
     id: String(rawMessage?.id ?? crypto.randomUUID()),
     senderKey: senderIsSystem ? "system" : senderKey,
@@ -327,6 +1702,7 @@ function sanitizeStoredMessage(rawMessage, participants) {
     deleted,
     deletedAt,
     attachments: deleted ? [] : attachments,
+    linkPreview: deleted ? null : linkPreview,
     replyToMessageId,
     replyTo,
     reactions: deleted ? [] : reactions,
@@ -337,11 +1713,12 @@ function sanitizeStoredMessage(rawMessage, participants) {
 
 function serializeStateForStorage() {
   return JSON.stringify({
-    version: 1,
+    version: 2,
     users: [...users.values()].map((user) => ({
       key: user.key,
       name: user.name,
-      password: user.password,
+      passwordHash: String(user.passwordHash ?? ""),
+      passwordSalt: String(user.passwordSalt ?? ""),
       avatarDataUrl: user.avatarDataUrl ?? null,
       friends: [...user.friends],
       incomingRequests: [...user.incomingRequests],
@@ -351,7 +1728,12 @@ function serializeStateForStorage() {
     })),
     sessions: [...sessions.entries()].map(([sessionId, userKey]) => ({
       sessionId,
-      userKey
+      userKey,
+      createdAt: sessionDetails.get(sessionId)?.createdAt ?? null,
+      lastSeenAt: sessionDetails.get(sessionId)?.lastSeenAt ?? null,
+      deviceName: sessionDetails.get(sessionId)?.deviceName ?? "",
+      userAgent: sessionDetails.get(sessionId)?.userAgent ?? "",
+      ipAddress: sessionDetails.get(sessionId)?.ipAddress ?? ""
     })),
     chats: [...chats.values()].map((chat) => ({
       id: chat.id,
@@ -359,6 +1741,17 @@ function serializeStateForStorage() {
       name: chat.name,
       participants: [...chat.participants],
       closeVotes: [...chat.closeVotes],
+      viewerPrefs:
+        chat.viewerPrefs instanceof Map
+          ? [...chat.viewerPrefs.entries()].map(([userKey, prefs]) => [
+              userKey,
+              {
+                nickname: String(prefs?.nickname ?? "").trim() || null,
+                theme: normalizeChatTheme(prefs?.theme),
+                wallpaper: normalizeChatWallpaper(prefs?.wallpaper)
+              }
+            ])
+          : [],
       updatedAt: Number(chat.updatedAt || Date.now()),
       messages: chat.messages.map((message) => ({
         id: message.id,
@@ -371,6 +1764,7 @@ function serializeStateForStorage() {
         deleted: Boolean(message.deleted),
         deletedAt: message.deletedAt ?? null,
         attachments: Array.isArray(message.attachments) ? message.attachments : [],
+        linkPreview: sanitizeLinkPreview(message.linkPreview),
         replyToMessageId: String(message.replyToMessageId ?? "").trim() || null,
         replyTo:
           message.replyTo && typeof message.replyTo === "object"
@@ -401,10 +1795,15 @@ function serializeStateForStorage() {
 
 function persistStateToDatabase() {
   const serializedState = serializeStateForStorage();
+  const storedState = encryptStatePayload(serializedState);
+
+  if (storedState === null) {
+    return;
+  }
 
   if (!upsertStateStatement) {
     try {
-      fs.writeFileSync(STATE_SNAPSHOT_PATH, serializedState, "utf8");
+      fs.writeFileSync(STATE_SNAPSHOT_PATH, storedState, "utf8");
     } catch (error) {
       console.error("Failed to persist state to JSON snapshot:", error);
     }
@@ -412,7 +1811,7 @@ function persistStateToDatabase() {
   }
 
   try {
-    upsertStateStatement.run(serializedState);
+    upsertStateStatement.run(storedState);
   } catch (error) {
     console.error("Failed to persist state to SQLite:", error);
   }
@@ -462,30 +1861,42 @@ async function restoreStateFromDatabase() {
     return;
   }
 
+  const decryptedState = decryptStatePayload(serializedState);
+  if (decryptedState === null) {
+    return;
+  }
+
   let parsedState;
 
   try {
-    parsedState = JSON.parse(serializedState);
+    parsedState = JSON.parse(decryptedState);
   } catch (error) {
     console.error("Persisted state is invalid JSON and was ignored:", error);
     return;
   }
 
   const rawUsers = Array.isArray(parsedState?.users) ? parsedState.users : [];
+  let shouldPersistMigratedPasswords = false;
 
   for (const rawUser of rawUsers) {
     const userKey = normalizeUserName(rawUser?.key);
     const name = cleanDisplayName(rawUser?.name);
-    const password = cleanPassword(rawUser?.password);
+    const passwordHash = String(rawUser?.passwordHash ?? "").trim().toLowerCase();
+    const passwordSalt = String(rawUser?.passwordSalt ?? "").trim().toLowerCase();
+    const hasPasswordHash = /^[a-f0-9]{128}$/.test(passwordHash);
+    const hasPasswordSalt = /^[a-f0-9]{32}$/.test(passwordSalt);
+    const hasValidPasswordHash = hasPasswordHash && hasPasswordSalt;
+    const legacyPassword = cleanPassword(rawUser?.password);
 
-    if (!userKey || !name || password.length < 4) {
+    if (!userKey || !name || (!hasValidPasswordHash && legacyPassword.length < 4)) {
       continue;
     }
 
-    users.set(userKey, {
+    const nextUser = {
       key: userKey,
       name,
-      password,
+      passwordHash: hasValidPasswordHash ? passwordHash : "",
+      passwordSalt: hasValidPasswordHash ? passwordSalt : "",
       avatarDataUrl: String(rawUser?.avatarDataUrl ?? "").startsWith("data:image/")
         ? String(rawUser.avatarDataUrl)
         : null,
@@ -494,7 +1905,14 @@ async function restoreStateFromDatabase() {
       incomingRequests: new Set(),
       outgoingRequests: new Set(),
       hiddenChats: new Set()
-    });
+    };
+
+    if (!isHashedPassword(nextUser) && legacyPassword.length >= 4) {
+      setUserPassword(nextUser, legacyPassword);
+      shouldPersistMigratedPasswords = true;
+    }
+
+    users.set(userKey, nextUser);
   }
 
   for (const rawUser of rawUsers) {
@@ -533,6 +1951,10 @@ async function restoreStateFromDatabase() {
     }
   }
 
+  if (shouldPersistMigratedPasswords) {
+    scheduleStatePersistence();
+  }
+
   const rawSessions = Array.isArray(parsedState?.sessions) ? parsedState.sessions : [];
 
   for (const rawSession of rawSessions) {
@@ -543,7 +1965,19 @@ async function restoreStateFromDatabase() {
       continue;
     }
 
+    const createdAt = normalizeSessionTimestamp(rawSession?.createdAt, new Date().toISOString());
+    const lastSeenAt = normalizeSessionTimestamp(rawSession?.lastSeenAt, createdAt);
+
     sessions.set(sessionId, userKey);
+    sessionDetails.set(sessionId, {
+      sessionId,
+      userKey,
+      createdAt,
+      lastSeenAt,
+      deviceName: cleanSessionDeviceName(rawSession?.deviceName),
+      userAgent: cleanSessionUserAgent(rawSession?.userAgent),
+      ipAddress: cleanSessionIpAddress(rawSession?.ipAddress)
+    });
 
     if (!sessionsByUser.has(userKey)) {
       sessionsByUser.set(userKey, new Set());
@@ -579,6 +2013,27 @@ async function restoreStateFromDatabase() {
       }
     }
 
+    const viewerPrefs = new Map();
+    const rawViewerPrefs = Array.isArray(rawChat?.viewerPrefs) ? rawChat.viewerPrefs : [];
+
+    for (const rawEntry of rawViewerPrefs) {
+      if (!Array.isArray(rawEntry) || rawEntry.length < 2) {
+        continue;
+      }
+
+      const prefUserKey = normalizeUserName(rawEntry[0]);
+
+      if (!prefUserKey || !participants.includes(prefUserKey)) {
+        continue;
+      }
+
+      const normalizedPrefs = normalizeViewerChatPreference(rawEntry[1]);
+
+      if (normalizedPrefs) {
+        viewerPrefs.set(prefUserKey, normalizedPrefs);
+      }
+    }
+
     chats.set(chatId, {
       id: chatId,
       type,
@@ -590,16 +2045,20 @@ async function restoreStateFromDatabase() {
           participants.includes(userKey)
         )
       ),
+      viewerPrefs,
       updatedAt: Number(rawChat?.updatedAt || Date.now())
     });
   }
 }
 
 function createUser(userKey, displayName, password) {
+  const { passwordHash, passwordSalt } = hashPassword(password);
+
   users.set(userKey, {
     key: userKey,
     name: displayName,
-    password,
+    passwordHash,
+    passwordSalt,
     avatarDataUrl: null,
     friendAliases: new Map(),
     friends: new Set(),
@@ -630,6 +2089,20 @@ function emitToUser(userKey, eventName, payload) {
 }
 
 function authenticateSocket(socket, userKey) {
+  const previousUserKey = socketToUser.get(socket.id);
+
+  if (previousUserKey && previousUserKey !== userKey) {
+    const previousSockets = onlineUsers.get(previousUserKey);
+
+    if (previousSockets) {
+      previousSockets.delete(socket.id);
+
+      if (previousSockets.size === 0) {
+        onlineUsers.delete(previousUserKey);
+      }
+    }
+  }
+
   if (!onlineUsers.has(userKey)) {
     onlineUsers.set(userKey, new Set());
   }
@@ -639,6 +2112,8 @@ function authenticateSocket(socket, userKey) {
 }
 
 function detachSocket(socketId) {
+  detachSocketFromSession(socketId);
+
   const userKey = socketToUser.get(socketId);
 
   if (!userKey) {
@@ -812,6 +2287,8 @@ function senderNameForViewer(message, viewerKey) {
 }
 
 function serializeMessage(message, viewerKey) {
+  const linkPreview = sanitizeLinkPreview(message.linkPreview);
+
   return {
     id: message.id,
     senderKey: message.senderKey,
@@ -823,6 +2300,7 @@ function serializeMessage(message, viewerKey) {
     deleted: Boolean(message.deleted),
     deletedAt: message.deletedAt ?? null,
     attachments: Array.isArray(message.attachments) ? message.attachments : [],
+    linkPreview,
     replyToMessageId: String(message.replyToMessageId ?? "").trim() || null,
     replyTo:
       message.replyTo && typeof message.replyTo === "object"
@@ -872,7 +2350,33 @@ function resolveUserKey(rawValue) {
   return null;
 }
 
+function viewerChatPreferencesForUser(chat, viewerKey) {
+  const fallback = {
+    nickname: null,
+    theme: "default",
+    wallpaper: null
+  };
+
+  if (!chat || !viewerKey || !chat.participants.includes(viewerKey)) {
+    return fallback;
+  }
+
+  if (!(chat.viewerPrefs instanceof Map)) {
+    return fallback;
+  }
+
+  const normalized = normalizeViewerChatPreference(chat.viewerPrefs.get(viewerKey));
+
+  if (!normalized) {
+    return fallback;
+  }
+
+  return normalized;
+}
+
 function serializeChat(chat, viewerKey) {
+  const viewerPrefs = viewerChatPreferencesForUser(chat, viewerKey);
+
   return {
     id: chat.id,
     type: chat.type,
@@ -883,11 +2387,18 @@ function serializeChat(chat, viewerKey) {
     ),
     messages: chat.messages.map((message) => serializeMessage(message, viewerKey)),
     closeVotes: [...chat.closeVotes],
+    viewerPrefs,
     updatedAt: chat.updatedAt
   };
 }
 
 function chatTitleForUser(chat, userKey) {
+  const viewerPrefs = viewerChatPreferencesForUser(chat, userKey);
+
+  if (viewerPrefs.nickname) {
+    return viewerPrefs.nickname;
+  }
+
   if (chat.type === "group") {
     return chat.name;
   }
@@ -928,6 +2439,20 @@ function messagePreview(message) {
     const hasImage = attachments.some((attachment) => {
       return String(attachment.type ?? "").startsWith("image/");
     });
+    const hasAudio = attachments.some((attachment) => {
+      return String(attachment.type ?? "").startsWith("audio/");
+    });
+    const hasVideo = attachments.some((attachment) => {
+      return String(attachment.type ?? "").startsWith("video/");
+    });
+
+    if (hasAudio && !hasImage && !hasVideo) {
+      return "[Voice note]";
+    }
+
+    if (hasVideo) {
+      return "[Video]";
+    }
 
     return hasImage ? "[Image]" : "[File]";
   }
@@ -986,28 +2511,166 @@ function emitGroupCreatedEvents(chat, creatorKey) {
   }
 }
 
-function createSessionForUser(userKey) {
+function attachSocketToSession(socketId, sessionId) {
+  if (!socketId || !sessionId) {
+    return;
+  }
+
+  const previousSessionId = socketToSession.get(socketId);
+
+  if (previousSessionId && previousSessionId !== sessionId) {
+    detachSocketFromSession(socketId);
+  }
+
+  socketToSession.set(socketId, sessionId);
+
+  if (!sessionToSockets.has(sessionId)) {
+    sessionToSockets.set(sessionId, new Set());
+  }
+
+  sessionToSockets.get(sessionId).add(socketId);
+}
+
+function detachSocketFromSession(socketId) {
+  const sessionId = socketToSession.get(socketId);
+
+  if (!sessionId) {
+    return null;
+  }
+
+  socketToSession.delete(socketId);
+
+  const socketIds = sessionToSockets.get(sessionId);
+
+  if (socketIds) {
+    socketIds.delete(socketId);
+
+    if (socketIds.size === 0) {
+      sessionToSockets.delete(sessionId);
+    }
+  }
+
+  return sessionId;
+}
+
+function sessionsForUser(userKey, currentSessionId = null) {
+  const userSessions = sessionsByUser.get(userKey) ?? new Set();
+  const result = [];
+
+  for (const sessionId of userSessions) {
+    const details = sessionDetails.get(sessionId) ?? {
+      sessionId,
+      userKey,
+      createdAt: null,
+      lastSeenAt: null,
+      deviceName: "",
+      userAgent: "",
+      ipAddress: ""
+    };
+
+    result.push({
+      sessionId,
+      label: inferSessionDeviceLabel(details),
+      deviceName: details.deviceName || null,
+      userAgent: details.userAgent || null,
+      ipAddress: details.ipAddress || null,
+      createdAt: details.createdAt,
+      lastSeenAt: details.lastSeenAt,
+      isCurrent: currentSessionId === sessionId
+    });
+  }
+
+  return result.sort((left, right) => {
+    return sessionTimeValue(right.lastSeenAt || right.createdAt) -
+      sessionTimeValue(left.lastSeenAt || left.createdAt);
+  });
+}
+
+function emitSessionStateForUser(userKey) {
+  for (const socketId of getUserSockets(userKey)) {
+    const currentSessionId = socketToSession.get(socketId) ?? null;
+    io.to(socketId).emit("sessions_updated", {
+      sessions: sessionsForUser(userKey, currentSessionId),
+      currentSessionId
+    });
+  }
+}
+
+function createSessionForUser(userKey, socket, requestedDeviceName = "") {
   const sessionId = crypto.randomUUID();
 
   sessions.set(sessionId, userKey);
+  sessionDetails.set(sessionId, buildSessionDetails(userKey, sessionId, socket, requestedDeviceName));
 
   if (!sessionsByUser.has(userKey)) {
     sessionsByUser.set(userKey, new Set());
   }
 
   sessionsByUser.get(userKey).add(sessionId);
+
+  if (socket) {
+    attachSocketToSession(socket.id, sessionId);
+  }
+
   scheduleStatePersistence();
   return sessionId;
 }
 
-function invalidateSession(sessionId) {
+function touchSessionForSocket(socket, sessionId, requestedDeviceName = "") {
   const userKey = sessions.get(sessionId);
 
   if (!userKey) {
-    return;
+    return null;
+  }
+
+  const nextDetails = buildSessionDetails(
+    userKey,
+    sessionId,
+    socket,
+    requestedDeviceName,
+    sessionDetails.get(sessionId)
+  );
+
+  sessionDetails.set(sessionId, nextDetails);
+
+  if (socket) {
+    attachSocketToSession(socket.id, sessionId);
+  }
+
+  scheduleStatePersistence();
+  return sessionId;
+}
+
+function invalidateSession(sessionId, options = {}) {
+  const disconnectSockets = Boolean(options.disconnectSockets);
+  const reason = String(options.reason ?? "revoked").slice(0, 40);
+  const userKey = sessions.get(sessionId);
+
+  if (!userKey) {
+    return null;
+  }
+
+  if (disconnectSockets) {
+    const socketIds = [...(sessionToSockets.get(sessionId) ?? new Set())];
+
+    for (const socketId of socketIds) {
+      const targetSocket = io.sockets.sockets.get(socketId);
+
+      if (!targetSocket) {
+        detachSocket(socketId);
+        continue;
+      }
+
+      targetSocket.emit("session_revoked", {
+        sessionId,
+        reason
+      });
+      targetSocket.disconnect(true);
+    }
   }
 
   sessions.delete(sessionId);
+  sessionDetails.delete(sessionId);
 
   const userSessions = sessionsByUser.get(userKey);
 
@@ -1019,29 +2682,51 @@ function invalidateSession(sessionId) {
     }
   }
 
+  const sessionSockets = sessionToSockets.get(sessionId);
+
+  if (sessionSockets) {
+    for (const socketId of sessionSockets) {
+      if (socketToSession.get(socketId) === sessionId) {
+        socketToSession.delete(socketId);
+      }
+    }
+
+    sessionToSockets.delete(sessionId);
+  }
+
   scheduleStatePersistence();
+  return userKey;
 }
 
-function invalidateSessionsForUser(userKey) {
-  const userSessions = sessionsByUser.get(userKey);
+function invalidateSessionsForUser(userKey, options = {}) {
+  const userSessions = [...(sessionsByUser.get(userKey) ?? new Set())];
 
-  if (!userSessions) {
-    return;
+  if (userSessions.length === 0) {
+    return 0;
   }
+
+  let invalidatedCount = 0;
 
   for (const sessionId of userSessions) {
-    sessions.delete(sessionId);
+    if (invalidateSession(sessionId, options)) {
+      invalidatedCount += 1;
+    }
   }
 
-  sessionsByUser.delete(userKey);
-  scheduleStatePersistence();
+  return invalidatedCount;
 }
 
 function createOrGetDirectChat(userA, userB, isTemp) {
   const chatId = buildDirectChatId(userA, userB, isTemp);
 
   if (chats.has(chatId)) {
-    return { chat: chats.get(chatId), created: false };
+    const existingChat = chats.get(chatId);
+
+    if (!(existingChat.viewerPrefs instanceof Map)) {
+      existingChat.viewerPrefs = new Map();
+    }
+
+    return { chat: existingChat, created: false };
   }
 
   const chat = {
@@ -1051,6 +2736,7 @@ function createOrGetDirectChat(userA, userB, isTemp) {
     participants: [userA, userB].sort(),
     messages: [],
     closeVotes: new Set(),
+    viewerPrefs: new Map(),
     updatedAt: Date.now()
   };
 
@@ -1071,6 +2757,7 @@ function createGroupChat(ownerKey, groupName, members) {
     participants: [ownerKey, ...sortUserKeys(uniqueMembers)],
     messages: [],
     closeVotes: new Set(),
+    viewerPrefs: new Map(),
     updatedAt: Date.now()
   };
 
@@ -1139,7 +2826,8 @@ function appendSystemMessage(chat, text, kind = "system") {
     text,
     kind,
     sentAt: new Date().toISOString(),
-    attachments: []
+    attachments: [],
+    linkPreview: null
   });
 
   scheduleStatePersistence();
@@ -1281,6 +2969,11 @@ function validateAndSanitizeAttachments(rawAttachments) {
   for (const rawAttachment of rawAttachments) {
     const dataUrl = String(rawAttachment?.dataUrl ?? "");
     const size = Number(rawAttachment?.size ?? 0);
+    const durationSecondsRaw = Number(rawAttachment?.durationSeconds ?? NaN);
+    const durationSeconds =
+      Number.isFinite(durationSecondsRaw) && durationSecondsRaw > 0
+        ? Math.min(24 * 60 * 60, Math.round(durationSecondsRaw * 100) / 100)
+        : null;
 
     if (!dataUrl.startsWith("data:")) {
       return { error: "Invalid attachment payload." };
@@ -1295,7 +2988,8 @@ function validateAndSanitizeAttachments(rawAttachments) {
       name: cleanFileName(rawAttachment?.name),
       type: String(rawAttachment?.type ?? "application/octet-stream").slice(0, 100),
       size,
-      dataUrl
+      dataUrl,
+      durationSeconds
     });
   }
 
@@ -1418,7 +3112,9 @@ function completedCallLogText(callSession) {
   return `${starterName} started a ${mode} call at ${startedAtLabel}. Duration ${duration}.`;
 }
 
-function completeAuth(socket, userKey, callback, existingSessionId = null) {
+function completeAuth(socket, userKey, callback, existingSessionId = null, requestedDeviceName = "") {
+  const previousUserKey = socketToUser.get(socket.id);
+
   authenticateSocket(socket, userKey);
   const deliveredChats = markUndeliveredMessagesAsDeliveredForUser(userKey);
 
@@ -1429,7 +3125,11 @@ function completeAuth(socket, userKey, callback, existingSessionId = null) {
   const sessionId =
     existingSessionId && sessions.get(existingSessionId) === userKey
       ? existingSessionId
-      : createSessionForUser(userKey);
+      : createSessionForUser(userKey, socket, requestedDeviceName);
+
+  if (sessionId === existingSessionId) {
+    touchSessionForSocket(socket, sessionId, requestedDeviceName);
+  }
 
   safeAck(callback, {
     ok: true,
@@ -1437,11 +3137,16 @@ function completeAuth(socket, userKey, callback, existingSessionId = null) {
     sessionId
   });
 
+  if (previousUserKey && previousUserKey !== userKey) {
+    emitPresenceStateForFriends(previousUserKey);
+  }
+
   emitRelationshipStateForNetwork(userKey);
   for (const chat of deliveredChats) {
     emitChatState(chat);
   }
   emitChatSummaries(userKey);
+  emitSessionStateForUser(userKey);
 }
 
 function validateAvatarDataUrl(avatarDataUrl) {
@@ -1486,7 +3191,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    completeAuth(socket, userKey, callback, sessionId);
+    completeAuth(socket, userKey, callback, sessionId, payload?.deviceName);
   });
 
   socket.on("signup", (payload, callback) => {
@@ -1519,7 +3224,7 @@ io.on("connection", (socket) => {
     }
 
     createUser(userKey, displayName, password);
-    completeAuth(socket, userKey, callback);
+    completeAuth(socket, userKey, callback, null, payload?.deviceName);
   });
 
   socket.on("login", (payload, callback) => {
@@ -1537,7 +3242,7 @@ io.on("connection", (socket) => {
 
     const user = users.get(userKey);
 
-    if (user.password !== password) {
+    if (!verifyUserPassword(user, password)) {
       safeAck(callback, {
         ok: false,
         error: "Incorrect password."
@@ -1545,7 +3250,11 @@ io.on("connection", (socket) => {
       return;
     }
 
-    completeAuth(socket, userKey, callback);
+    if (maybeMigrateLegacyPassword(user)) {
+      scheduleStatePersistence();
+    }
+
+    completeAuth(socket, userKey, callback, null, payload?.deviceName);
   });
 
   socket.on("update_profile", (payload, callback) => {
@@ -1621,7 +3330,7 @@ io.on("connection", (socket) => {
     const currentPassword = cleanPassword(payload?.currentPassword);
     const nextPassword = cleanPassword(payload?.newPassword);
 
-    if (user.password !== currentPassword) {
+    if (!verifyUserPassword(user, currentPassword)) {
       safeAck(callback, { ok: false, error: "Current password is incorrect." });
       return;
     }
@@ -1631,7 +3340,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    user.password = nextPassword;
+    setUserPassword(user, nextPassword);
     scheduleStatePersistence();
     safeAck(callback, { ok: true });
   });
@@ -1652,7 +3361,7 @@ io.on("connection", (socket) => {
 
     const password = cleanPassword(payload?.password);
 
-    if (user.password !== password) {
+    if (!verifyUserPassword(user, password)) {
       safeAck(callback, { ok: false, error: "Password is incorrect." });
       return;
     }
@@ -2179,6 +3888,7 @@ io.on("connection", (socket) => {
     }
 
     safeAck(callback, { ok: true, chat: serializeChat(chat, currentUser) });
+    hydrateWeakVideoPreviewsForChat(chat, 4);
   });
 
   socket.on("hide_chat", (payload, callback) => {
@@ -2254,6 +3964,81 @@ io.on("connection", (socket) => {
     }
 
     safeAck(callback, { ok: true });
+  });
+
+  socket.on("set_chat_preferences", (payload, callback) => {
+    const currentUser = getCurrentUser(socket, callback);
+
+    if (!currentUser) {
+      return;
+    }
+
+    const chatId = String(payload?.chatId ?? "").trim();
+    const chat = chats.get(chatId);
+
+    if (!chat || !chat.participants.includes(currentUser)) {
+      safeAck(callback, { ok: false, error: "Chat not found." });
+      return;
+    }
+
+    if (!(chat.viewerPrefs instanceof Map)) {
+      chat.viewerPrefs = new Map();
+    }
+
+    const currentPrefs = viewerChatPreferencesForUser(chat, currentUser);
+    const nextPrefs = {
+      nickname: currentPrefs.nickname,
+      theme: currentPrefs.theme,
+      wallpaper: currentPrefs.wallpaper
+    };
+
+    const hasNickname = Object.prototype.hasOwnProperty.call(payload ?? {}, "nickname");
+    const hasTheme = Object.prototype.hasOwnProperty.call(payload ?? {}, "theme");
+    const hasWallpaper = Object.prototype.hasOwnProperty.call(payload ?? {}, "wallpaper");
+
+    if (hasNickname) {
+      const nickname = cleanChatNickname(payload?.nickname);
+      nextPrefs.nickname = nickname || null;
+    }
+
+    if (hasTheme) {
+      nextPrefs.theme = normalizeChatTheme(payload?.theme);
+    }
+
+    if (hasWallpaper) {
+      const rawWallpaper = String(payload?.wallpaper ?? "").trim();
+      const wallpaper = normalizeChatWallpaper(rawWallpaper);
+
+      if (rawWallpaper && !wallpaper) {
+        safeAck(callback, {
+          ok: false,
+          error: "Wallpaper must be a valid http(s) or data:image URL."
+        });
+        return;
+      }
+
+      nextPrefs.wallpaper = wallpaper;
+    }
+
+    const normalizedNext = normalizeViewerChatPreference(nextPrefs);
+    const normalizedCurrent = normalizeViewerChatPreference(currentPrefs);
+    const nextSerialized = JSON.stringify(normalizedNext ?? null);
+    const currentSerialized = JSON.stringify(normalizedCurrent ?? null);
+
+    if (nextSerialized === currentSerialized) {
+      safeAck(callback, { ok: true, prefs: normalizedNext ?? null });
+      return;
+    }
+
+    if (normalizedNext) {
+      chat.viewerPrefs.set(currentUser, normalizedNext);
+    } else {
+      chat.viewerPrefs.delete(currentUser);
+    }
+
+    scheduleStatePersistence();
+    emitChatState(chat);
+    safeAck(callback, { ok: true, prefs: normalizedNext ?? null });
   });
 
   socket.on("toggle_reaction", (payload, callback) => {
@@ -2550,13 +4335,17 @@ io.on("connection", (socket) => {
         }
       : null;
 
+    const messageId = crypto.randomUUID();
+    const previewCandidate = linkPreviewForText(text);
+
     chat.messages.push({
-      id: crypto.randomUUID(),
+      id: messageId,
       senderKey: currentUser,
       senderName: displayNameFor(currentUser),
       text,
       sentAt,
       attachments,
+      linkPreview: previewCandidate.preview,
       replyToMessageId: replyTarget?.id ?? null,
       replyTo: replySnapshot,
       reactions: [],
@@ -2573,6 +4362,11 @@ io.on("connection", (socket) => {
     safeAck(callback, { ok: true });
 
     const sentMessage = chat.messages.at(-1);
+
+    if (previewCandidate.previewUrl && !previewCandidate.cacheHit) {
+      hydrateMessageLinkPreview(chat.id, messageId, previewCandidate.previewUrl).catch(() => {});
+    }
+
     const preview = messagePreview(sentMessage);
 
     for (const participant of chat.participants) {
@@ -2639,12 +4433,19 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const previewCandidate = linkPreviewForText(nextText);
     message.text = nextText;
+    message.linkPreview = previewCandidate.preview;
     message.editedAt = new Date().toISOString();
     chat.updatedAt = Date.now();
     scheduleStatePersistence();
 
     emitChatState(chat);
+
+    if (previewCandidate.previewUrl && !previewCandidate.cacheHit) {
+      hydrateMessageLinkPreview(chat.id, message.id, previewCandidate.previewUrl).catch(() => {});
+    }
+
     safeAck(callback, { ok: true });
   });
 
@@ -2683,6 +4484,7 @@ io.on("connection", (socket) => {
 
     message.text = "";
     message.attachments = [];
+    message.linkPreview = null;
     message.reactions = [];
     message.editedAt = null;
     message.deleted = true;
@@ -2694,8 +4496,108 @@ io.on("connection", (socket) => {
     safeAck(callback, { ok: true });
   });
 
+  socket.on("list_sessions", (payload, callback) => {
+    const currentUser = getCurrentUser(socket, callback);
+
+    if (!currentUser) {
+      return;
+    }
+
+    const currentSessionId = socketToSession.get(socket.id) ?? null;
+
+    safeAck(callback, {
+      ok: true,
+      currentSessionId,
+      sessions: sessionsForUser(currentUser, currentSessionId)
+    });
+  });
+
+  socket.on("revoke_session", (payload, callback) => {
+    const currentUser = getCurrentUser(socket, callback);
+
+    if (!currentUser) {
+      return;
+    }
+
+    const currentSessionId = socketToSession.get(socket.id) ?? null;
+    const targetSessionId = String(payload?.sessionId ?? "").trim();
+
+    if (!targetSessionId) {
+      safeAck(callback, { ok: false, error: "Session not found." });
+      return;
+    }
+
+    if (sessions.get(targetSessionId) !== currentUser) {
+      safeAck(callback, { ok: false, error: "Session not found." });
+      return;
+    }
+
+    if (currentSessionId && targetSessionId === currentSessionId) {
+      safeAck(callback, { ok: false, error: "Use Log Out for this device." });
+      return;
+    }
+
+    invalidateSession(targetSessionId, {
+      disconnectSockets: true,
+      reason: "revoked"
+    });
+
+    emitSessionStateForUser(currentUser);
+
+    safeAck(callback, {
+      ok: true,
+      revokedCount: 1,
+      currentSessionId,
+      sessions: sessionsForUser(currentUser, currentSessionId)
+    });
+  });
+
+  socket.on("revoke_other_sessions", (payload, callback) => {
+    const currentUser = getCurrentUser(socket, callback);
+
+    if (!currentUser) {
+      return;
+    }
+
+    const currentSessionId = socketToSession.get(socket.id) ?? null;
+
+    if (!currentSessionId) {
+      safeAck(callback, { ok: false, error: "Current session not found." });
+      return;
+    }
+
+    const userSessions = [...(sessionsByUser.get(currentUser) ?? new Set())];
+    let revokedCount = 0;
+
+    for (const sessionId of userSessions) {
+      if (sessionId === currentSessionId) {
+        continue;
+      }
+
+      if (
+        invalidateSession(sessionId, {
+          disconnectSockets: true,
+          reason: "revoked"
+        })
+      ) {
+        revokedCount += 1;
+      }
+    }
+
+    emitSessionStateForUser(currentUser);
+
+    safeAck(callback, {
+      ok: true,
+      revokedCount,
+      currentSessionId,
+      sessions: sessionsForUser(currentUser, currentSessionId)
+    });
+  });
+
   socket.on("logout", (payload, callback) => {
-    const sessionId = String(payload?.sessionId ?? "").trim();
+    const payloadSessionId = String(payload?.sessionId ?? "").trim();
+    const currentSessionId = socketToSession.get(socket.id) ?? null;
+    const sessionId = payloadSessionId || currentSessionId;
 
     if (sessionId) {
       invalidateSession(sessionId);
@@ -2705,6 +4607,7 @@ io.on("connection", (socket) => {
 
     if (userKey) {
       emitPresenceStateForFriends(userKey);
+      emitSessionStateForUser(userKey);
     }
 
     safeAck(callback, { ok: true });
@@ -3388,5 +5291,7 @@ process.on("SIGTERM", () => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Server listening on http://localhost:${PORT} (persistence: ${persistenceBackend})`);
+  console.log(
+    `Server listening on http://localhost:${PORT} (persistence: ${persistenceBackend}, stateEncryption: ${stateEncryptionKey ? "on" : "off"})`
+  );
 });
