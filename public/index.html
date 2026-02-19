@@ -75,7 +75,7 @@
         </footer>
       </aside>
 
-      <main class="chat panel">
+      <main id="chatPanel" class="chat panel">
         <header class="chat-header">
           <button id="mobileSidebarButton" class="action-button mobile-only" type="button">
             Menu
@@ -153,6 +153,9 @@
                   />
                 </svg>
               </button>
+              <button id="chatPrefsButton" class="action-button" type="button" title="Chat style">
+                Style
+              </button>
               <button id="openTempChatButton" class="action-button" type="button">Temp</button>
               <button id="closeTempChatButton" class="action-button hidden" type="button">
                 Close Temp
@@ -163,7 +166,7 @@
                 id="messageSearchInput"
                 type="search"
                 maxlength="80"
-                placeholder="Search messages"
+                placeholder="Search (from:user links media files)"
                 autocomplete="off"
               />
             </label>
@@ -171,6 +174,9 @@
         </header>
 
         <section id="messages" class="messages"></section>
+        <button id="jumpToUnreadButton" class="jump-unread-button hidden" type="button">
+          Jump to unread
+        </button>
         <section id="typingIndicator" class="typing-indicator hidden"></section>
 
         <section id="attachmentPreview" class="attachment-preview hidden"></section>
@@ -189,6 +195,13 @@
               <button id="attachUploadButton" class="action-button attach-menu-item" type="button">
                 Upload
               </button>
+              <button
+                id="attachVoiceNoteButton"
+                class="action-button attach-menu-item"
+                type="button"
+              >
+                Voice Note
+              </button>
             </div>
           </div>
           <button id="stickerButton" class="action-button" type="button" title="Emoji and GIF">
@@ -197,14 +210,14 @@
           <input id="fileInput" type="file" multiple class="hidden" />
           <input id="photoInput" type="file" accept="image/*" class="hidden" />
           <input id="cameraInput" type="file" accept="image/*" capture="environment" class="hidden" />
-          <input
+          <textarea
             id="messageInput"
-            type="text"
             maxlength="1200"
             placeholder="Message"
             autocomplete="off"
+            rows="1"
             disabled
-          />
+          ></textarea>
           <button id="sendButton" class="button-primary" type="submit" disabled>
             Send
           </button>
@@ -304,22 +317,86 @@
             autocomplete="off"
             required
           />
-          <input
-            id="authPasswordInput"
-            type="password"
-            maxlength="64"
-            placeholder="Password"
-            autocomplete="off"
-            required
-          />
-          <div id="authConfirmRow" class="hidden">
+          <div class="password-input-wrap">
             <input
-              id="authConfirmInput"
+              id="authPasswordInput"
               type="password"
               maxlength="64"
-              placeholder="Confirm password"
+              placeholder="Password"
               autocomplete="off"
+              required
             />
+            <button
+              id="authPasswordToggleButton"
+              class="password-toggle-button"
+              type="button"
+              aria-label="Show password"
+              aria-pressed="false"
+              title="Show password"
+            >
+              <svg
+                class="password-toggle-icon"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6Z"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linejoin="round"
+                />
+                <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8" />
+                <path
+                  class="password-toggle-slash"
+                  d="M4 20 20 4"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </button>
+          </div>
+          <div id="authConfirmRow" class="hidden">
+            <div class="password-input-wrap">
+              <input
+                id="authConfirmInput"
+                type="password"
+                maxlength="64"
+                placeholder="Confirm password"
+                autocomplete="off"
+              />
+              <button
+                id="authConfirmToggleButton"
+                class="password-toggle-button"
+                type="button"
+                aria-label="Show password"
+                aria-pressed="false"
+                title="Show password"
+              >
+                <svg
+                  class="password-toggle-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6Z"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linejoin="round"
+                  />
+                  <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8" />
+                  <path
+                    class="password-toggle-slash"
+                    d="M4 20 20 4"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                  />
+                </svg>
+              </button>
+            </div>
           </div>
           <button id="authSubmitButton" class="button-primary" type="submit">Login</button>
         </form>
@@ -373,6 +450,18 @@
             </button>
           </section>
 
+          <section class="settings-block">
+            <h3>Devices</h3>
+            <p class="settings-sessions-copy">Manage where your account is signed in.</p>
+            <button id="revokeOtherSessionsButton" class="action-button" type="button">
+              Sign Out Other Devices
+            </button>
+            <ul id="settingsSessionsList" class="settings-sessions-list"></ul>
+            <p id="settingsSessionsEmpty" class="settings-sessions-empty hidden">
+              No active sessions found.
+            </p>
+          </section>
+
           <section class="settings-block danger">
             <h3>Account</h3>
             <input
@@ -389,6 +478,9 @@
 
           <button id="enableNotificationsButton" class="action-button" type="button">
             Desktop Notifications
+          </button>
+          <button id="toggleEnterToSendButton" class="action-button" type="button">
+            Enter to send: On
           </button>
           <button id="logoutButton" class="action-button" type="button">Log Out</button>
         </div>
