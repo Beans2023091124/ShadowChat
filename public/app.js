@@ -2,6 +2,8 @@ const socket = io();
 const SESSION_STORAGE_KEY = "shadow_chat_session_id";
 const NOTIFICATION_PREF_KEY = "shadow_chat_notifications_enabled";
 const LAST_OPEN_CHAT_STORAGE_PREFIX = "shadow_chat_last_open_chat_";
+const CHAT_DRAFT_STORAGE_PREFIX = "shadow_chat_draft_";
+const ENTER_TO_SEND_PREF_KEY = "shadow_chat_enter_to_send";
 
 const state = {
   currentUser: null,
@@ -19,6 +21,7 @@ const state = {
   replyingTo: null,
   typingByChatId: {},
   pendingAttachments: [],
+  composerSending: false,
   unreadByChatId: {},
   unreadAnchorByChatId: {},
   activeUnreadAnchorMessageId: null,
@@ -30,14 +33,24 @@ const state = {
   pendingIncomingCall: null,
   call: null,
   settingsAvatarDataUrl: null,
+  settingsSessions: [],
+  settingsSessionsLoading: false,
   isResumingSession: false,
   notificationsEnabled: localStorage.getItem(NOTIFICATION_PREF_KEY) !== "off",
+  enterToSendEnabled: localStorage.getItem(ENTER_TO_SEND_PREF_KEY) !== "off",
   pendingLastOpenChatId: null,
   hasAttemptedLastChatRestore: false,
   stickerTab: "emoji",
   emojiCatalog: [],
   emojiCatalogLoaded: false,
-  gifResults: []
+  gifResults: [],
+  voiceNoteRecorder: null,
+  voiceNoteStream: null,
+  voiceNoteChunks: [],
+  voiceNoteMimeType: "",
+  voiceNoteChatId: null,
+  voiceNoteStartedAt: 0,
+  voiceNoteFinalizing: false
 };
 
 const elements = {
@@ -51,8 +64,10 @@ const elements = {
   authForm: document.getElementById("authForm"),
   authUsernameInput: document.getElementById("authUsernameInput"),
   authPasswordInput: document.getElementById("authPasswordInput"),
+  authPasswordToggleButton: document.getElementById("authPasswordToggleButton"),
   authConfirmRow: document.getElementById("authConfirmRow"),
   authConfirmInput: document.getElementById("authConfirmInput"),
+  authConfirmToggleButton: document.getElementById("authConfirmToggleButton"),
   authSubmitButton: document.getElementById("authSubmitButton"),
   authSwitchText: document.getElementById("authSwitchText"),
 
@@ -78,11 +93,13 @@ const elements = {
   selfName: document.getElementById("selfName"),
   settingsButton: document.getElementById("settingsButton"),
 
+  chatPanel: document.getElementById("chatPanel"),
   chatTitle: document.getElementById("chatTitle"),
   chatSubtitle: document.getElementById("chatSubtitle"),
   messageSearchInput: document.getElementById("messageSearchInput"),
   voiceCallButton: document.getElementById("voiceCallButton"),
   videoCallButton: document.getElementById("videoCallButton"),
+  chatPrefsButton: document.getElementById("chatPrefsButton"),
   openTempChatButton: document.getElementById("openTempChatButton"),
   closeTempChatButton: document.getElementById("closeTempChatButton"),
   messages: document.getElementById("messages"),
@@ -96,6 +113,7 @@ const elements = {
   attachCameraButton: document.getElementById("attachCameraButton"),
   attachPhotoButton: document.getElementById("attachPhotoButton"),
   attachUploadButton: document.getElementById("attachUploadButton"),
+  attachVoiceNoteButton: document.getElementById("attachVoiceNoteButton"),
   stickerButton: document.getElementById("stickerButton"),
   fileInput: document.getElementById("fileInput"),
   photoInput: document.getElementById("photoInput"),
@@ -135,9 +153,13 @@ const elements = {
   settingsCurrentPasswordInput: document.getElementById("settingsCurrentPasswordInput"),
   settingsNewPasswordInput: document.getElementById("settingsNewPasswordInput"),
   changePasswordButton: document.getElementById("changePasswordButton"),
+  revokeOtherSessionsButton: document.getElementById("revokeOtherSessionsButton"),
+  settingsSessionsList: document.getElementById("settingsSessionsList"),
+  settingsSessionsEmpty: document.getElementById("settingsSessionsEmpty"),
   settingsDeletePasswordInput: document.getElementById("settingsDeletePasswordInput"),
   deleteAccountButton: document.getElementById("deleteAccountButton"),
   enableNotificationsButton: document.getElementById("enableNotificationsButton"),
+  toggleEnterToSendButton: document.getElementById("toggleEnterToSendButton"),
   logoutButton: document.getElementById("logoutButton"),
 
   inlinePromptModal: document.getElementById("inlinePromptModal"),
@@ -216,6 +238,8 @@ const MAX_RING_COUNT = 5;
 const RING_INTERVAL_MS = 4000;
 const TYPING_PULSE_MS = 1800;
 const TYPING_REMOTE_TTL_MS = 4200;
+const VOICE_NOTE_MAX_DURATION_MS = 120000;
+const VOICE_NOTE_MAX_SIZE_BYTES = 5 * 1024 * 1024;
 const CALL_QUALITY_POLL_MS = 2800;
 const CALL_RECONNECT_GRACE_MS = 12000;
 const VOICE_ACTIVITY_POLL_MS = 120;
@@ -246,10 +270,12 @@ const QUICK_REACTIONS = [
   "\u{1F622}",
   "\u{1F525}"
 ];
+const CHAT_THEME_OPTIONS = ["default", "slate", "forest", "sunset", "night"];
 
 let toastTimeout;
 let outgoingRingTimer;
 let incomingRingTimer;
+let voiceNoteDurationTimer;
 let callDurationTimer;
 let callQualityTimer;
 let callReconnectTimer;
@@ -264,6 +290,8 @@ let remoteVideoDragState;
 let callAnnotationPointerState = null;
 let emojiLoadPromise;
 let gifSearchAbortController;
+let composerDragDepth = 0;
+let activeComposerDraftChatId = null;
 
 function initials(value) {
   const compact = String(value ?? "").trim();
@@ -309,6 +337,11 @@ function clearOutgoingRingTimer() {
 function clearIncomingRingTimer() {
   clearInterval(incomingRingTimer);
   incomingRingTimer = undefined;
+}
+
+function clearVoiceNoteDurationTimer() {
+  clearInterval(voiceNoteDurationTimer);
+  voiceNoteDurationTimer = undefined;
 }
 
 function clearCallDurationTimer() {
@@ -358,6 +391,26 @@ function setSessionId(sessionId) {
   localStorage.setItem(SESSION_STORAGE_KEY, value);
 }
 
+function currentDeviceName() {
+  const userAgentData = navigator.userAgentData;
+
+  if (userAgentData && typeof userAgentData.platform === "string") {
+    const platform = userAgentData.platform.trim();
+
+    if (platform) {
+      return `${platform} ${userAgentData.mobile ? "Mobile" : "Desktop"}`.slice(0, 64);
+    }
+  }
+
+  const platform = String(navigator.platform ?? "").trim();
+
+  if (platform) {
+    return platform.slice(0, 64);
+  }
+
+  return "Browser";
+}
+
 function lastOpenChatStorageKey() {
   const userKey = String(state.currentUser?.key ?? "").trim();
   return userKey ? `${LAST_OPEN_CHAT_STORAGE_PREFIX}${userKey}` : "";
@@ -404,6 +457,172 @@ function clearStoredLastOpenChatIdIfMatches(chatId) {
   }
 }
 
+function draftStorageKey(chatId) {
+  const userKey = String(state.currentUser?.key ?? "").trim();
+  const normalizedChatId = String(chatId ?? "").trim();
+
+  if (!userKey || !normalizedChatId) {
+    return "";
+  }
+
+  return `${CHAT_DRAFT_STORAGE_PREFIX}${userKey}_${normalizedChatId}`;
+}
+
+function readStoredDraft(chatId) {
+  const key = draftStorageKey(chatId);
+
+  if (!key) {
+    return "";
+  }
+
+  return String(localStorage.getItem(key) ?? "").slice(0, 1200);
+}
+
+function storeDraft(chatId, text) {
+  const key = draftStorageKey(chatId);
+
+  if (!key) {
+    return;
+  }
+
+  const value = String(text ?? "").slice(0, 1200);
+
+  if (!value) {
+    localStorage.removeItem(key);
+    return;
+  }
+
+  localStorage.setItem(key, value);
+}
+
+function clearStoredDraft(chatId) {
+  const key = draftStorageKey(chatId);
+
+  if (!key) {
+    return;
+  }
+
+  localStorage.removeItem(key);
+}
+
+function storeActiveChatDraft() {
+  const activeChatId = String(state.activeChat?.id ?? "").trim();
+
+  if (!activeChatId) {
+    return;
+  }
+
+  storeDraft(activeChatId, elements.messageInput.value);
+}
+
+function restoreDraftForActiveChat() {
+  const activeChatId = String(state.activeChat?.id ?? "").trim();
+
+  if (!activeChatId) {
+    elements.messageInput.value = "";
+    resizeComposerInput();
+    return;
+  }
+
+  const draft = readStoredDraft(activeChatId);
+
+  if (elements.messageInput.value !== draft) {
+    elements.messageInput.value = draft;
+  }
+
+  resizeComposerInput();
+}
+
+function normalizeChatThemeValue(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return CHAT_THEME_OPTIONS.includes(normalized) ? normalized : "default";
+}
+
+function sanitizeChatWallpaper(value) {
+  const raw = String(value ?? "").trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  if (raw.startsWith("data:image/")) {
+    return raw;
+  }
+
+  try {
+    const parsed = new URL(raw);
+
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return parsed.toString();
+    }
+  } catch {}
+
+  return "";
+}
+
+function activeChatViewerPrefs() {
+  const fallback = {
+    nickname: "",
+    theme: "default",
+    wallpaper: ""
+  };
+
+  if (!state.activeChat || !state.activeChat.viewerPrefs || typeof state.activeChat.viewerPrefs !== "object") {
+    return fallback;
+  }
+
+  const nickname = String(state.activeChat.viewerPrefs.nickname ?? "").trim();
+  const theme = normalizeChatThemeValue(state.activeChat.viewerPrefs.theme);
+  const wallpaper = sanitizeChatWallpaper(state.activeChat.viewerPrefs.wallpaper);
+
+  return {
+    nickname,
+    theme,
+    wallpaper
+  };
+}
+
+function applyActiveChatAppearance() {
+  if (!elements.chatPanel || !elements.messages) {
+    return;
+  }
+
+  for (const theme of CHAT_THEME_OPTIONS) {
+    if (theme === "default") {
+      continue;
+    }
+
+    elements.chatPanel.classList.remove(`theme-${theme}`);
+  }
+
+  elements.messages.classList.remove("has-wallpaper");
+  elements.messages.style.backgroundImage = "";
+  elements.messages.style.backgroundSize = "";
+  elements.messages.style.backgroundPosition = "";
+  elements.messages.style.backgroundRepeat = "";
+
+  if (!state.activeChat) {
+    return;
+  }
+
+  const prefs = activeChatViewerPrefs();
+
+  if (prefs.theme !== "default") {
+    elements.chatPanel.classList.add(`theme-${prefs.theme}`);
+  }
+
+  if (prefs.wallpaper) {
+    const escapedWallpaper = prefs.wallpaper.replace(/"/g, "%22");
+    elements.messages.classList.add("has-wallpaper");
+    elements.messages.style.backgroundImage = `linear-gradient(rgba(14, 14, 16, 0.76), rgba(14, 14, 16, 0.76)), url("${escapedWallpaper}")`;
+    elements.messages.style.backgroundSize = "cover";
+    elements.messages.style.backgroundPosition = "center";
+    elements.messages.style.backgroundRepeat = "no-repeat";
+  }
+}
+
 function completeAuth(response) {
   state.isResumingSession = false;
   state.currentUser = response.user;
@@ -415,6 +634,8 @@ function completeAuth(response) {
   elements.authUsernameInput.value = "";
   elements.authPasswordInput.value = "";
   elements.authConfirmInput.value = "";
+  setAuthPasswordVisibility(false);
+  setAuthConfirmPasswordVisibility(false);
 
   updateSelfStrip();
   renderRelationshipState();
@@ -443,10 +664,24 @@ function clearClientSessionState() {
   state.groupCreateSelectedKeys = new Set();
   state.groupCreateBaseUserKey = null;
   state.groupCreateTargetChatId = null;
+  state.settingsAvatarDataUrl = null;
+  state.settingsSessions = [];
+  state.settingsSessionsLoading = false;
   state.pendingLastOpenChatId = null;
   state.hasAttemptedLastChatRestore = false;
   state.stickerTab = "emoji";
   state.gifResults = [];
+  state.composerSending = false;
+  if (state.voiceNoteRecorder) {
+    stopVoiceNoteRecording(false);
+  }
+  clearVoiceNoteDurationTimer();
+  state.voiceNoteStream = null;
+  state.voiceNoteChunks = [];
+  state.voiceNoteMimeType = "";
+  state.voiceNoteChatId = null;
+  state.voiceNoteStartedAt = 0;
+  state.voiceNoteFinalizing = false;
   stopLocalTyping();
   hideGroupQuickPopover();
   closeInlinePrompt(null);
@@ -466,6 +701,8 @@ function clearClientSessionState() {
   renderRelationshipState();
   renderChatList();
   renderActiveChat();
+  renderSettingsSessions();
+  updateVoiceNoteButton();
 }
 
 function tryResumeSession() {
@@ -480,7 +717,7 @@ function tryResumeSession() {
   }
 
   state.isResumingSession = true;
-  socket.emit("resume_session", { sessionId }, (response) => {
+  socket.emit("resume_session", { sessionId, deviceName: currentDeviceName() }, (response) => {
     state.isResumingSession = false;
 
     if (!response?.ok) {
@@ -868,6 +1105,8 @@ function insertTextAtCursor(input, textToInsert) {
   const nextCaret = start + insert.length;
   input.setSelectionRange(nextCaret, nextCaret);
   input.focus();
+  resizeComposerInput();
+  storeActiveChatDraft();
   touchLocalTypingState();
 }
 
@@ -1279,6 +1518,153 @@ function showGroupChatActions(summary, x, y) {
       onSelect: () => deleteGroupChat(summary)
     }
   ]);
+}
+
+function saveActiveChatPreferences(patch, successMessage = "Chat settings updated.") {
+  if (!state.activeChat) {
+    return;
+  }
+
+  socket.emit(
+    "set_chat_preferences",
+    {
+      chatId: state.activeChat.id,
+      ...patch
+    },
+    (response) => {
+      if (!response?.ok) {
+        showToast(response?.error ?? "Could not update chat settings.");
+        return;
+      }
+
+      if (response.prefs && state.activeChat) {
+        state.activeChat.viewerPrefs = response.prefs;
+      }
+
+      applyActiveChatAppearance();
+      renderActiveChat();
+      showToast(successMessage);
+    }
+  );
+}
+
+async function promptSetActiveChatNickname() {
+  if (!state.activeChat) {
+    return;
+  }
+
+  const prefs = activeChatViewerPrefs();
+  const nickname = await openInlinePrompt({
+    title: "Chat nickname",
+    description: "Set a private nickname for this chat on your account.",
+    initialValue: prefs.nickname,
+    placeholder: "Nickname",
+    submitLabel: "Save",
+    maxLength: 48,
+    multiline: false
+  });
+
+  if (nickname === null) {
+    return;
+  }
+
+  saveActiveChatPreferences(
+    {
+      nickname
+    },
+    String(nickname).trim() ? "Chat nickname saved." : "Chat nickname cleared."
+  );
+}
+
+async function promptSetActiveChatWallpaper() {
+  if (!state.activeChat) {
+    return;
+  }
+
+  const prefs = activeChatViewerPrefs();
+  const wallpaper = await openInlinePrompt({
+    title: "Chat wallpaper",
+    description: "Use an image URL or data:image URL. Leave empty to clear.",
+    initialValue: prefs.wallpaper,
+    placeholder: "https://example.com/wallpaper.jpg",
+    submitLabel: "Save",
+    maxLength: 2048,
+    multiline: false
+  });
+
+  if (wallpaper === null) {
+    return;
+  }
+
+  saveActiveChatPreferences(
+    {
+      wallpaper
+    },
+    String(wallpaper).trim() ? "Wallpaper saved." : "Wallpaper cleared."
+  );
+}
+
+function openActiveChatStyleMenu(anchorElement) {
+  if (!state.activeChat || !anchorElement) {
+    return;
+  }
+
+  const prefs = activeChatViewerPrefs();
+  const rect = anchorElement.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.bottom + 8;
+
+  const items = [
+    {
+      label: "Set chat nickname",
+      onSelect: () => {
+        promptSetActiveChatNickname();
+      }
+    },
+    {
+      label: "Set wallpaper URL",
+      onSelect: () => {
+        promptSetActiveChatWallpaper();
+      }
+    }
+  ];
+
+  if (prefs.nickname) {
+    items.push({
+      label: "Clear nickname",
+      onSelect: () => {
+        saveActiveChatPreferences({ nickname: "" }, "Chat nickname cleared.");
+      }
+    });
+  }
+
+  if (prefs.wallpaper) {
+    items.push({
+      label: "Clear wallpaper",
+      onSelect: () => {
+        saveActiveChatPreferences({ wallpaper: "" }, "Wallpaper cleared.");
+      }
+    });
+  }
+
+  const themeLabel = {
+    default: "Default",
+    slate: "Slate",
+    forest: "Forest",
+    sunset: "Sunset",
+    night: "Night"
+  };
+
+  for (const theme of CHAT_THEME_OPTIONS) {
+    items.push({
+      label: `${prefs.theme === theme ? "Theme * " : "Theme "} ${themeLabel[theme] ?? theme}`,
+      onSelect: () => {
+        saveActiveChatPreferences({ theme }, `Theme set to ${themeLabel[theme] ?? theme}.`);
+      }
+    });
+  }
+
+  showContextMenu(x, y, items);
 }
 
 function hideGroupQuickPopover() {
@@ -1719,15 +2105,108 @@ function updateJumpToUnreadButton() {
   elements.jumpToUnreadButton.classList.toggle("hidden", visible);
 }
 
-function messageMatchesSearch(message, query) {
-  const normalizedQuery = String(query ?? "").trim().toLowerCase();
+function searchFiltersFromQuery(query) {
+  const tokens = String(query ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const filters = {
+    hasLinks: false,
+    hasMedia: false,
+    hasFiles: false,
+    from: "",
+    terms: []
+  };
 
-  if (!normalizedQuery) {
+  for (const token of tokens) {
+    const normalized = token.toLowerCase();
+
+    if (normalized === "links" || normalized === "link" || normalized === "has:links") {
+      filters.hasLinks = true;
+      continue;
+    }
+
+    if (normalized === "media" || normalized === "has:media") {
+      filters.hasMedia = true;
+      continue;
+    }
+
+    if (normalized === "files" || normalized === "file" || normalized === "has:files") {
+      filters.hasFiles = true;
+      continue;
+    }
+
+    if (normalized.startsWith("from:") && normalized.length > 5) {
+      filters.from = normalized.slice(5);
+      continue;
+    }
+
+    filters.terms.push(normalized);
+  }
+
+  return filters;
+}
+
+function messageHasLinks(message) {
+  const text = String(message?.text ?? "");
+
+  if (/\b(?:https?:\/\/|www\.)[^\s]+/i.test(text)) {
+    return true;
+  }
+
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  return attachments.some((attachment) => {
+    const name = String(attachment?.name ?? "");
+    return /\b(?:https?:\/\/|www\.)[^\s]+/i.test(name);
+  });
+}
+
+function messageHasMedia(message) {
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  return attachments.some((attachment) => {
+    const type = String(attachment?.type ?? "").toLowerCase();
+    return type.startsWith("image/") || type.startsWith("video/") || type.startsWith("audio/");
+  });
+}
+
+function messageHasFiles(message) {
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  return attachments.some((attachment) => {
+    const type = String(attachment?.type ?? "").toLowerCase();
+    return !type.startsWith("image/") && !type.startsWith("video/") && !type.startsWith("audio/");
+  });
+}
+
+function messageMatchesSearch(message, query) {
+  const filters = searchFiltersFromQuery(query);
+
+  if (filters.from) {
+    const sender = String(message?.senderName ?? "").toLowerCase();
+    const senderKey = String(message?.senderKey ?? "").toLowerCase();
+    if (!sender.includes(filters.from) && !senderKey.includes(filters.from)) {
+      return false;
+    }
+  }
+
+  if (filters.hasLinks && !messageHasLinks(message)) {
+    return false;
+  }
+
+  if (filters.hasMedia && !messageHasMedia(message)) {
+    return false;
+  }
+
+  if (filters.hasFiles && !messageHasFiles(message)) {
+    return false;
+  }
+
+  if (filters.terms.length === 0) {
     return true;
   }
 
   const parts = [
     String(message.senderName ?? ""),
+    String(message.senderKey ?? ""),
     String(message.text ?? ""),
     String(message.kind ?? "")
   ];
@@ -1735,6 +2214,7 @@ function messageMatchesSearch(message, query) {
   const attachments = Array.isArray(message.attachments) ? message.attachments : [];
   for (const attachment of attachments) {
     parts.push(String(attachment?.name ?? ""));
+    parts.push(String(attachment?.type ?? ""));
   }
 
   if (message.replyTo && typeof message.replyTo === "object") {
@@ -1742,7 +2222,17 @@ function messageMatchesSearch(message, query) {
     parts.push(String(message.replyTo.text ?? ""));
   }
 
-  return parts.join(" ").toLowerCase().includes(normalizedQuery);
+  if (message.linkPreview && typeof message.linkPreview === "object") {
+    parts.push(String(message.linkPreview.title ?? ""));
+    parts.push(String(message.linkPreview.description ?? ""));
+    parts.push(String(message.linkPreview.siteName ?? ""));
+    parts.push(String(message.linkPreview.authorName ?? ""));
+    parts.push(String(message.linkPreview.providerKey ?? ""));
+    parts.push(String(message.linkPreview.url ?? ""));
+  }
+
+  const haystack = parts.join(" ").toLowerCase();
+  return filters.terms.every((term) => haystack.includes(term));
 }
 
 function typingUsersForActiveChat() {
@@ -2279,6 +2769,26 @@ function updateNotificationToggleButton() {
     : "Enable desktop notifications";
 }
 
+function persistEnterToSendPreference() {
+  localStorage.setItem(ENTER_TO_SEND_PREF_KEY, state.enterToSendEnabled ? "on" : "off");
+}
+
+function setEnterToSendEnabled(enabled) {
+  state.enterToSendEnabled = Boolean(enabled);
+  persistEnterToSendPreference();
+  updateEnterToSendToggleButton();
+}
+
+function updateEnterToSendToggleButton() {
+  if (!elements.toggleEnterToSendButton) {
+    return;
+  }
+
+  elements.toggleEnterToSendButton.textContent = state.enterToSendEnabled
+    ? "Enter to send: On (Shift+Enter newline)"
+    : "Enter to send: Off (Enter newline)";
+}
+
 function isMobileViewport() {
   return window.matchMedia("(max-width: 900px)").matches;
 }
@@ -2301,6 +2811,42 @@ function setAuthMode(mode) {
   elements.authSwitchText.textContent = signup
     ? "Have an account? Switch to Login."
     : "Need an account? Switch to Sign Up.";
+  setAuthPasswordVisibility(false);
+  setAuthConfirmPasswordVisibility(false);
+}
+
+function setPasswordInputVisibility({ input, button, visible }) {
+  if (!input) {
+    return;
+  }
+
+  const shouldShow = Boolean(visible);
+  input.type = shouldShow ? "text" : "password";
+
+  if (!button) {
+    return;
+  }
+
+  button.setAttribute("aria-label", shouldShow ? "Hide password" : "Show password");
+  button.setAttribute("aria-pressed", shouldShow ? "true" : "false");
+  button.title = shouldShow ? "Hide password" : "Show password";
+  button.classList.toggle("is-visible", shouldShow);
+}
+
+function setAuthPasswordVisibility(visible) {
+  setPasswordInputVisibility({
+    input: elements.authPasswordInput,
+    button: elements.authPasswordToggleButton,
+    visible
+  });
+}
+
+function setAuthConfirmPasswordVisibility(visible) {
+  setPasswordInputVisibility({
+    input: elements.authConfirmInput,
+    button: elements.authConfirmToggleButton,
+    visible
+  });
 }
 
 function syncAttachMenuButtonState() {
@@ -2308,6 +2854,47 @@ function syncAttachMenuButtonState() {
   elements.attachCameraButton.disabled = !enabled;
   elements.attachUploadButton.disabled = !enabled;
   elements.attachPhotoButton.disabled = !enabled || !isMobileViewport();
+  if (elements.attachVoiceNoteButton) {
+    elements.attachVoiceNoteButton.disabled = !enabled;
+  }
+}
+
+function resizeComposerInput() {
+  const input = elements.messageInput;
+
+  if (!input) {
+    return;
+  }
+
+  const minHeight = 42;
+  const maxHeight = 128;
+  input.style.height = "auto";
+  const nextHeight = Math.max(minHeight, Math.min(maxHeight, input.scrollHeight));
+  input.style.height = `${nextHeight}px`;
+  input.style.overflowY = input.scrollHeight > maxHeight ? "auto" : "hidden";
+}
+
+function composerCanAcceptFiles() {
+  return Boolean(state.currentUser && state.activeChat && !elements.messageInput.disabled);
+}
+
+function hasFileDragPayload(dataTransfer) {
+  const types = dataTransfer?.types;
+
+  if (!types) {
+    return false;
+  }
+
+  return Array.from(types).includes("Files");
+}
+
+function setComposerDragActive(active) {
+  elements.composerForm.classList.toggle("drag-active", Boolean(active));
+}
+
+function resetComposerDragState() {
+  composerDragDepth = 0;
+  setComposerDragActive(false);
 }
 
 function setComposerEnabled(enabled) {
@@ -2321,7 +2908,14 @@ function setComposerEnabled(enabled) {
     stopLocalTyping();
     closeAttachMenu();
     closeStickerMenu();
+    resetComposerDragState();
+    if (state.voiceNoteRecorder) {
+      stopVoiceNoteRecording(false);
+    }
   }
+
+  resizeComposerInput();
+  updateVoiceNoteButton();
 }
 
 function createEmptyItem(message) {
@@ -2391,6 +2985,292 @@ function renderSettingsAvatarPreview() {
   });
 }
 
+function formatSettingsSessionIpAddress(rawValue) {
+  const ipAddress = String(rawValue ?? "").trim();
+
+  if (!ipAddress) {
+    return "Unknown";
+  }
+
+  if (ipAddress.startsWith("::ffff:")) {
+    return ipAddress.slice(7);
+  }
+
+  if (ipAddress === "::1") {
+    return "127.0.0.1";
+  }
+
+  return ipAddress;
+}
+
+function browserNameForSessionUserAgent(rawUserAgent) {
+  const ua = String(rawUserAgent ?? "").toLowerCase();
+
+  if (!ua) {
+    return "";
+  }
+
+  if (ua.includes("edg/")) {
+    return "Edge";
+  }
+
+  if (ua.includes("opr/") || ua.includes("opera")) {
+    return "Opera";
+  }
+
+  if (ua.includes("firefox/")) {
+    return "Firefox";
+  }
+
+  if (ua.includes("chrome/") || ua.includes("crios/")) {
+    return "Chrome";
+  }
+
+  if (ua.includes("safari/")) {
+    return "Safari";
+  }
+
+  return "";
+}
+
+function osNameForSession(session) {
+  const ua = String(session?.userAgent ?? "").toLowerCase();
+
+  if (ua.includes("windows")) {
+    return "Windows";
+  }
+
+  if (ua.includes("android")) {
+    return "Android";
+  }
+
+  if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod")) {
+    return "iOS";
+  }
+
+  if (ua.includes("mac os x") || ua.includes("macintosh")) {
+    return "macOS";
+  }
+
+  if (ua.includes("linux")) {
+    return "Linux";
+  }
+
+  const fallback = String(session?.deviceName ?? session?.label ?? "").toLowerCase();
+
+  if (fallback.includes("windows")) {
+    return "Windows";
+  }
+
+  if (fallback.includes("android")) {
+    return "Android";
+  }
+
+  if (fallback.includes("ios") || fallback.includes("iphone") || fallback.includes("ipad")) {
+    return "iOS";
+  }
+
+  if (fallback.includes("mac")) {
+    return "macOS";
+  }
+
+  if (fallback.includes("linux")) {
+    return "Linux";
+  }
+
+  return "Device";
+}
+
+function formatSettingsSessionPrimaryLabel(session) {
+  const os = osNameForSession(session);
+  const browser = browserNameForSessionUserAgent(session?.userAgent);
+
+  if (browser) {
+    return `${os} • ${browser}`.toUpperCase();
+  }
+
+  const fallbackLabel = String(session?.label ?? "").trim();
+  return (fallbackLabel || os).toUpperCase();
+}
+
+function formatSettingsSessionRelativeTime(isoDate) {
+  const timestamp = Date.parse(String(isoDate ?? ""));
+
+  if (!Number.isFinite(timestamp)) {
+    return "active time unknown";
+  }
+
+  const diffMs = Date.now() - timestamp;
+  const absMs = Math.abs(diffMs);
+  const steps = [
+    { unit: "year", ms: 1000 * 60 * 60 * 24 * 365 },
+    { unit: "month", ms: 1000 * 60 * 60 * 24 * 30 },
+    { unit: "week", ms: 1000 * 60 * 60 * 24 * 7 },
+    { unit: "day", ms: 1000 * 60 * 60 * 24 },
+    { unit: "hour", ms: 1000 * 60 * 60 },
+    { unit: "minute", ms: 1000 * 60 }
+  ];
+
+  if (absMs < 60 * 1000) {
+    return diffMs >= 0 ? "active just now" : "active in under a minute";
+  }
+
+  for (const step of steps) {
+    if (absMs >= step.ms) {
+      const value = Math.floor(absMs / step.ms);
+      const suffix = value === 1 ? "" : "s";
+
+      if (diffMs >= 0) {
+        return `active ${value} ${step.unit}${suffix} ago`;
+      }
+
+      return `active in ${value} ${step.unit}${suffix}`;
+    }
+  }
+
+  return "active just now";
+}
+
+function renderSettingsSessions() {
+  if (
+    !elements.settingsSessionsList ||
+    !elements.settingsSessionsEmpty ||
+    !elements.revokeOtherSessionsButton
+  ) {
+    return;
+  }
+
+  const sessions = Array.isArray(state.settingsSessions) ? state.settingsSessions : [];
+  const hasOtherSession = sessions.some((session) => !session?.isCurrent);
+
+  elements.settingsSessionsList.innerHTML = "";
+  elements.revokeOtherSessionsButton.disabled =
+    !state.currentUser || state.settingsSessionsLoading || !hasOtherSession;
+
+  if (state.settingsSessionsLoading) {
+    elements.settingsSessionsEmpty.textContent = "Loading sessions...";
+    elements.settingsSessionsEmpty.classList.remove("hidden");
+    return;
+  }
+
+  if (sessions.length === 0) {
+    elements.settingsSessionsEmpty.textContent = "No active sessions found.";
+    elements.settingsSessionsEmpty.classList.remove("hidden");
+    return;
+  }
+
+  elements.settingsSessionsEmpty.classList.add("hidden");
+
+  for (const session of sessions) {
+    const item = document.createElement("li");
+    item.className = "settings-session-item";
+
+    const main = document.createElement("div");
+    main.className = "settings-session-main";
+
+    const icon = document.createElement("div");
+    icon.className = "settings-session-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none"><rect x="4.5" y="5.5" width="15" height="10.5" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M9 19h6m-4.5-3h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+    main.append(icon);
+
+    const body = document.createElement("div");
+    body.className = "settings-session-body";
+
+    const head = document.createElement("div");
+    head.className = "settings-session-head";
+
+    const label = document.createElement("p");
+    label.className = "settings-session-label";
+    label.textContent = formatSettingsSessionPrimaryLabel(session);
+    head.append(label);
+
+    const actions = document.createElement("div");
+    actions.className = "settings-session-actions";
+
+    if (session?.isCurrent === true) {
+      const badge = document.createElement("span");
+      badge.className = "settings-session-current";
+      badge.textContent = "This device";
+      actions.append(badge);
+    }
+
+    if (!session?.isCurrent) {
+      const revokeButton = document.createElement("button");
+      revokeButton.type = "button";
+      revokeButton.className = "action-button settings-session-revoke";
+      revokeButton.textContent = "Sign Out";
+      revokeButton.addEventListener("click", () => {
+        if (!state.currentUser || state.settingsSessionsLoading) {
+          return;
+        }
+
+        state.settingsSessionsLoading = true;
+        renderSettingsSessions();
+
+        socket.emit("revoke_session", { sessionId: session.sessionId }, (response) => {
+          state.settingsSessionsLoading = false;
+
+          if (!response?.ok) {
+            showToast(response?.error ?? "Could not sign out that device.");
+            renderSettingsSessions();
+            return;
+          }
+
+          state.settingsSessions = Array.isArray(response.sessions) ? response.sessions : [];
+          renderSettingsSessions();
+          showToast("Device signed out.");
+        });
+      });
+      actions.append(revokeButton);
+    }
+
+    if (actions.childElementCount > 0) {
+      head.append(actions);
+    }
+
+    body.append(head);
+
+    const meta = document.createElement("p");
+    meta.className = "settings-session-meta";
+    meta.textContent = `IP ${formatSettingsSessionIpAddress(session?.ipAddress)} | ${formatSettingsSessionRelativeTime(
+      session?.lastSeenAt ?? session?.createdAt
+    )}`;
+    body.append(meta);
+
+    main.append(body);
+    item.append(main);
+    elements.settingsSessionsList.append(item);
+  }
+}
+
+function refreshSettingsSessions(showErrors = true) {
+  if (!state.currentUser) {
+    return;
+  }
+
+  state.settingsSessionsLoading = true;
+  renderSettingsSessions();
+
+  socket.emit("list_sessions", {}, (response) => {
+    state.settingsSessionsLoading = false;
+
+    if (!response?.ok) {
+      state.settingsSessions = [];
+      renderSettingsSessions();
+
+      if (showErrors) {
+        showToast(response?.error ?? "Could not load active sessions.");
+      }
+      return;
+    }
+
+    state.settingsSessions = Array.isArray(response.sessions) ? response.sessions : [];
+    renderSettingsSessions();
+  });
+}
+
 function openSettingsModal() {
   if (!state.currentUser) {
     return;
@@ -2406,9 +3286,14 @@ function openSettingsModal() {
   elements.settingsCurrentPasswordInput.value = "";
   elements.settingsNewPasswordInput.value = "";
   elements.settingsDeletePasswordInput.value = "";
+  state.settingsSessions = [];
+  state.settingsSessionsLoading = true;
   renderSettingsAvatarPreview();
+  renderSettingsSessions();
   updateNotificationToggleButton();
+  updateEnterToSendToggleButton();
   elements.settingsModal.classList.remove("hidden");
+  refreshSettingsSessions();
 }
 
 function updateHeaderActions() {
@@ -2429,6 +3314,9 @@ function updateHeaderActions() {
 
   elements.voiceCallButton.disabled = !isDirect;
   elements.videoCallButton.disabled = !isDirect;
+  if (elements.chatPrefsButton) {
+    elements.chatPrefsButton.disabled = !state.activeChat;
+  }
   elements.toggleGroupPanelButton.disabled = !canUseGroupButton;
   elements.openTempChatButton.disabled = !isDirect || isTempChat;
   elements.toggleGroupPanelButton.title = isGroup ? "Add members" : "Create group";
@@ -2448,6 +3336,8 @@ function updateHeaderActions() {
     elements.closeTempChatButton.disabled = alreadyVoted;
     elements.closeTempChatButton.textContent = alreadyVoted ? "Waiting" : "Close Temp";
   }
+
+  updateVoiceNoteButton();
 }
 
 function renderProfilePanel() {
@@ -2675,6 +3565,8 @@ function renderOutgoingRequests() {
 }
 
 function openChatWith(target, isTemp) {
+  storeActiveChatDraft();
+
   const withUserKey = typeof target === "object" && target ? target.key : null;
   const withUser = typeof target === "string" ? target : target?.name;
 
@@ -2772,6 +3664,8 @@ function renderRelationshipState() {
 }
 
 function loadChat(chatId, onLoaded) {
+  storeActiveChatDraft();
+
   socket.emit("load_chat", { chatId }, (response) => {
     if (!response?.ok) {
       showToast(response?.error ?? "Could not load chat.");
@@ -2931,6 +3825,303 @@ function renderChatList() {
   }
 }
 
+function formatAudioDurationSeconds(valueInSeconds, useRoundedSeconds = false) {
+  const numericValue = Number(valueInSeconds);
+
+  if (!Number.isFinite(numericValue)) {
+    return "--:--";
+  }
+
+  const totalSeconds = Math.max(0, useRoundedSeconds ? Math.round(numericValue) : Math.floor(numericValue));
+
+  if (totalSeconds === 0) {
+    return "0:00";
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function sanitizeAttachmentDurationSeconds(value) {
+  const numeric = Number(value);
+
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+
+  return Math.min(24 * 60 * 60, Math.round(numeric * 100) / 100);
+}
+
+function volumeIconMarkup(mode) {
+  switch (mode) {
+    case "muted":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M11 5 6 9H3v6h3l5 4z"></path>
+          <path d="m16.5 9.5 4 4"></path>
+          <path d="m20.5 9.5-4 4"></path>
+        </svg>
+      `;
+    case "low":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M11 5 6 9H3v6h3l5 4z"></path>
+          <path d="M16 12a3.2 3.2 0 0 0-1.7-2.85"></path>
+        </svg>
+      `;
+    default:
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M11 5 6 9H3v6h3l5 4z"></path>
+          <path d="M16 8.5a5 5 0 0 1 0 7"></path>
+          <path d="M18.8 6a8.4 8.4 0 0 1 0 12"></path>
+        </svg>
+      `;
+  }
+}
+
+function createMessageAudioPlayer(dataUrl, preferredTotalSeconds = null) {
+  const player = document.createElement("div");
+  player.className = "message-audio-player";
+
+  const playButton = document.createElement("button");
+  playButton.type = "button";
+  playButton.className = "message-audio-play";
+  playButton.textContent = "\u25B6";
+  playButton.setAttribute("aria-label", "Play audio");
+
+  const timeLabel = document.createElement("span");
+  timeLabel.className = "message-audio-time";
+  const initialTotalSeconds = sanitizeAttachmentDurationSeconds(preferredTotalSeconds);
+  timeLabel.textContent = `0:00 / ${
+    initialTotalSeconds !== null ? formatAudioDurationSeconds(initialTotalSeconds) : "--:--"
+  }`;
+
+  const seek = document.createElement("input");
+  seek.type = "range";
+  seek.className = "message-audio-seek";
+  seek.min = "0";
+  seek.max = "1000";
+  seek.step = "1";
+  seek.value = "0";
+  seek.disabled = true;
+  seek.setAttribute("aria-label", "Seek audio");
+
+  const volumeWrap = document.createElement("div");
+  volumeWrap.className = "message-audio-volume";
+
+  const muteButton = document.createElement("button");
+  muteButton.type = "button";
+  muteButton.className = "message-audio-mute";
+  muteButton.setAttribute("aria-label", "Mute audio");
+
+  const volumeSeek = document.createElement("input");
+  volumeSeek.type = "range";
+  volumeSeek.className = "message-audio-volume-seek";
+  volumeSeek.min = "0";
+  volumeSeek.max = "100";
+  volumeSeek.step = "1";
+  volumeSeek.value = "100";
+  volumeSeek.setAttribute("aria-label", "Volume");
+
+  const audio = document.createElement("audio");
+  audio.className = "message-audio";
+  audio.preload = "auto";
+  audio.src = dataUrl;
+  audio.load();
+
+  let lastNonZeroVolume = 1;
+  let playbackRafId = 0;
+  let playPrimingUntil = 0;
+  let totalSeconds = initialTotalSeconds;
+
+  const setRangeProgress = (input, ratio, cssVariableName) => {
+    if (!input) {
+      return;
+    }
+
+    const normalized = Math.max(0, Math.min(1, Number(ratio) || 0));
+    input.style.setProperty(cssVariableName, `${Math.round(normalized * 100)}%`);
+  };
+
+  const syncDuration = () => {
+    const duration = Number(audio.duration);
+
+    if (!Number.isFinite(duration) || duration <= 0) {
+      seek.disabled = true;
+      updateTimeAndSeek();
+      return;
+    }
+
+    totalSeconds = sanitizeAttachmentDurationSeconds(duration) ?? totalSeconds;
+    seek.disabled = false;
+    updateTimeAndSeek();
+  };
+
+  const updateTimeAndSeek = () => {
+    const duration = Number(audio.duration);
+    const current = Math.max(0, Number(audio.currentTime || 0));
+    const currentLabel = formatAudioDurationSeconds(current, true);
+    const totalLabel =
+      totalSeconds !== null ? formatAudioDurationSeconds(totalSeconds) : "--:--";
+
+    if (!Number.isFinite(duration) || duration <= 0) {
+      seek.value = "0";
+      setRangeProgress(seek, 0, "--seek-progress");
+      timeLabel.textContent = `${currentLabel} / ${totalLabel}`;
+      return;
+    }
+
+    totalSeconds = sanitizeAttachmentDurationSeconds(duration) ?? totalSeconds;
+    const ratio = Math.max(0, Math.min(1, current / duration));
+    seek.value = String(Math.round(ratio * 1000));
+    setRangeProgress(seek, ratio, "--seek-progress");
+    timeLabel.textContent = `${currentLabel} / ${formatAudioDurationSeconds(totalSeconds ?? duration)}`;
+  };
+
+  const stopPlaybackTicker = () => {
+    if (playbackRafId) {
+      window.cancelAnimationFrame(playbackRafId);
+      playbackRafId = 0;
+    }
+  };
+
+  const startPlaybackTicker = () => {
+    stopPlaybackTicker();
+    playPrimingUntil = Date.now() + 700;
+
+    const tick = () => {
+      updateTimeAndSeek();
+
+      if (!audio.ended && (!audio.paused || Date.now() < playPrimingUntil)) {
+        playbackRafId = window.requestAnimationFrame(tick);
+      } else {
+        playbackRafId = 0;
+      }
+    };
+
+    playbackRafId = window.requestAnimationFrame(tick);
+  };
+
+  const syncPlayButton = () => {
+    const isPlaying = !audio.paused && !audio.ended;
+    playButton.textContent = isPlaying ? "\u275A\u275A" : "\u25B6";
+    playButton.setAttribute("aria-label", isPlaying ? "Pause audio" : "Play audio");
+  };
+
+  const syncMuteButton = () => {
+    const muted = audio.muted || audio.volume === 0;
+    const iconMode = muted ? "muted" : audio.volume < 0.5 ? "low" : "high";
+    muteButton.innerHTML = volumeIconMarkup(iconMode);
+    muteButton.setAttribute("aria-label", muted ? "Unmute audio" : "Mute audio");
+    const normalizedVolume = Math.max(0, Math.min(1, Number(audio.volume) || 0));
+    volumeSeek.value = String(Math.round(normalizedVolume * 100));
+    setRangeProgress(volumeSeek, normalizedVolume, "--volume-progress");
+  };
+
+  playButton.addEventListener("click", async () => {
+    if (audio.paused || audio.ended) {
+      playButton.textContent = "\u275A\u275A";
+      playButton.setAttribute("aria-label", "Pause audio");
+      startPlaybackTicker();
+
+      try {
+        await audio.play();
+      } catch {
+        stopPlaybackTicker();
+        syncPlayButton();
+        updateTimeAndSeek();
+        return;
+      }
+    } else {
+      stopPlaybackTicker();
+      audio.pause();
+    }
+
+    syncPlayButton();
+    updateTimeAndSeek();
+  });
+
+  muteButton.addEventListener("click", () => {
+    const currentlyMuted = audio.muted || audio.volume === 0;
+
+    if (currentlyMuted) {
+      const restored = Math.max(0.05, Math.min(1, Number(lastNonZeroVolume) || 1));
+      audio.muted = false;
+      audio.volume = restored;
+      syncMuteButton();
+      return;
+    }
+
+    lastNonZeroVolume = Math.max(0.05, Math.min(1, Number(audio.volume) || 1));
+    audio.muted = true;
+    audio.volume = 0;
+    syncMuteButton();
+  });
+
+  volumeSeek.addEventListener("input", () => {
+    const volume = Math.max(0, Math.min(1, Number(volumeSeek.value) / 100));
+    audio.muted = volume === 0;
+    audio.volume = volume;
+
+    if (volume > 0) {
+      lastNonZeroVolume = volume;
+    }
+
+    syncMuteButton();
+  });
+
+  seek.addEventListener("input", () => {
+    const duration = Number(audio.duration);
+
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return;
+    }
+
+    const ratio = Math.max(0, Math.min(1, Number(seek.value) / 1000));
+    audio.currentTime = ratio * duration;
+    updateTimeAndSeek();
+  });
+
+  audio.addEventListener("loadedmetadata", syncDuration);
+  audio.addEventListener("durationchange", syncDuration);
+  audio.addEventListener("timeupdate", updateTimeAndSeek);
+  audio.addEventListener("play", () => {
+    playPrimingUntil = 0;
+    syncPlayButton();
+    updateTimeAndSeek();
+    startPlaybackTicker();
+  });
+  audio.addEventListener("pause", () => {
+    syncPlayButton();
+    updateTimeAndSeek();
+    stopPlaybackTicker();
+  });
+  audio.addEventListener("ended", () => {
+    audio.currentTime = 0;
+    syncPlayButton();
+    updateTimeAndSeek();
+    stopPlaybackTicker();
+  });
+  audio.addEventListener("volumechange", syncMuteButton);
+
+  syncPlayButton();
+  syncMuteButton();
+  setRangeProgress(seek, 0, "--seek-progress");
+  updateTimeAndSeek();
+
+  volumeWrap.append(muteButton, volumeSeek);
+  player.append(playButton, timeLabel, seek, volumeWrap, audio);
+  return player;
+}
+
 function renderMessageAttachments(message) {
   const attachments = Array.isArray(message.attachments) ? message.attachments : [];
 
@@ -2961,6 +4152,46 @@ function renderMessageAttachments(message) {
       link.rel = "noopener noreferrer";
       link.textContent = `Download ${name}`;
       wrapper.append(link);
+      continue;
+    }
+
+    if (type.startsWith("audio/")) {
+      wrapper.append(
+        createMessageAudioPlayer(
+          dataUrl,
+          sanitizeAttachmentDurationSeconds(attachment?.durationSeconds)
+        )
+      );
+
+      const voiceLink = document.createElement("a");
+      voiceLink.className = "attachment-link";
+      voiceLink.href = dataUrl;
+      voiceLink.download = name;
+      voiceLink.target = "_blank";
+      voiceLink.rel = "noopener noreferrer";
+      voiceLink.textContent = name.toLowerCase().startsWith("voice-note")
+        ? "Download voice note"
+        : `Download ${name}`;
+      wrapper.append(voiceLink);
+      continue;
+    }
+
+    if (type.startsWith("video/")) {
+      const video = document.createElement("video");
+      video.className = "message-video";
+      video.src = dataUrl;
+      video.controls = true;
+      video.preload = "metadata";
+      wrapper.append(video);
+
+      const videoLink = document.createElement("a");
+      videoLink.className = "attachment-link";
+      videoLink.href = dataUrl;
+      videoLink.download = name;
+      videoLink.target = "_blank";
+      videoLink.rel = "noopener noreferrer";
+      videoLink.textContent = `Download ${name}`;
+      wrapper.append(videoLink);
       continue;
     }
 
@@ -3049,6 +4280,548 @@ function buildClickableMessageText(textValue) {
   }
 
   return fragment;
+}
+
+function normalizeMessageLinkPreview(rawPreview) {
+  if (!rawPreview || typeof rawPreview !== "object") {
+    return null;
+  }
+
+  const rawUrl = String(rawPreview.url ?? "").trim();
+
+  if (!rawUrl) {
+    return null;
+  }
+
+  let parsedUrl = null;
+
+  try {
+    parsedUrl = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    return null;
+  }
+
+  const title = String(rawPreview.title ?? "").trim().slice(0, 160) || parsedUrl.hostname;
+  const description = String(rawPreview.description ?? "").trim().slice(0, 260);
+  const siteName = String(rawPreview.siteName ?? "").trim().slice(0, 90) || parsedUrl.hostname;
+  const authorName = String(rawPreview.authorName ?? "").trim().slice(0, 90);
+  const providerKeyRaw = String(rawPreview.providerKey ?? "").trim().toLowerCase();
+  const host = parsedUrl.hostname.toLowerCase();
+  let providerKey = providerKeyRaw;
+
+  if (!providerKey) {
+    if (host.includes("youtube") || host === "youtu.be") {
+      providerKey = "youtube";
+    } else if (host.includes("tiktok.com") || host === "vm.tiktok.com" || host === "vt.tiktok.com") {
+      providerKey = "tiktok";
+    } else {
+      providerKey = "website";
+    }
+  }
+  const imageUrlRaw = String(rawPreview.imageUrl ?? "").trim();
+  let imageUrl = null;
+
+  if (imageUrlRaw) {
+    try {
+      const parsedImageUrl = new URL(imageUrlRaw);
+
+      if (parsedImageUrl.protocol === "http:" || parsedImageUrl.protocol === "https:") {
+        imageUrl = parsedImageUrl.toString();
+      }
+    } catch {}
+  }
+
+  if (!imageUrl && providerKey === "youtube") {
+    const videoId = youtubeVideoIdFromUrl(parsedUrl.toString());
+
+    if (videoId) {
+      imageUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+    }
+  }
+
+  let resolvedAuthorName = authorName || null;
+
+  if (providerKey === "tiktok") {
+    const parsedUsername = tiktokUsernameFromUrl(parsedUrl.toString());
+
+    if (!resolvedAuthorName && parsedUsername) {
+      resolvedAuthorName = parsedUsername;
+    }
+
+    if (resolvedAuthorName && !resolvedAuthorName.startsWith("@")) {
+      resolvedAuthorName = `@${resolvedAuthorName}`;
+    }
+  }
+
+  return {
+    url: parsedUrl.toString(),
+    title,
+    description: description || null,
+    siteName,
+    imageUrl,
+    authorName: resolvedAuthorName,
+    providerKey
+  };
+}
+
+function linkPreviewAccentColor(providerKey) {
+  switch (String(providerKey ?? "").trim().toLowerCase()) {
+    case "youtube":
+      return "#f23f43";
+    case "tiktok":
+      return "#25f4ee";
+    case "twitter":
+      return "#1d9bf0";
+    case "github":
+      return "#a8a8a8";
+    default:
+      return "#72767d";
+  }
+}
+
+function normalizePreviewLabel(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/+$/, "");
+}
+
+function linkPreviewProviderLabel(preview) {
+  const providerKey = String(preview?.providerKey ?? "").trim().toLowerCase();
+
+  switch (providerKey) {
+    case "youtube":
+      return "YouTube";
+    case "tiktok":
+      return "TikTok";
+    case "twitter":
+      return "X";
+    case "github":
+      return "GitHub";
+    default:
+      return String(preview?.siteName ?? "").trim();
+  }
+}
+
+function looksLikeHostOrDomainLabel(value) {
+  const normalized = normalizePreviewLabel(value);
+
+  if (!normalized) {
+    return true;
+  }
+
+  if (!normalized.includes(".")) {
+    return false;
+  }
+
+  return /^[a-z0-9.-]+\.[a-z]{2,}(\/.*)?$/i.test(normalized);
+}
+
+function linkPreviewDisplayTitle(preview, providerLabel, hostLabel) {
+  const provider = String(preview?.providerKey ?? "").trim().toLowerCase();
+  const rawTitle = String(preview?.title ?? "").trim();
+  const normalizedTitle = normalizePreviewLabel(rawTitle);
+  const normalizedHost = normalizePreviewLabel(hostLabel);
+  const normalizedSite = normalizePreviewLabel(preview?.siteName ?? "");
+
+  if (provider === "youtube" || provider === "tiktok") {
+    if (
+      rawTitle &&
+      !looksLikeHostOrDomainLabel(rawTitle) &&
+      normalizedTitle !== normalizePreviewLabel(providerLabel)
+    ) {
+      return rawTitle;
+    }
+
+    const description = String(preview?.description ?? "").trim();
+
+    if (description && !looksLikeHostOrDomainLabel(description)) {
+      return description;
+    }
+
+    return provider === "youtube" ? "YouTube video" : "TikTok video";
+  }
+
+  if (
+    !rawTitle ||
+    normalizedTitle === normalizedHost ||
+    normalizedTitle === normalizedSite ||
+    normalizedTitle === normalizePreviewLabel(providerLabel)
+  ) {
+    return providerLabel ? `Open on ${providerLabel}` : rawTitle || hostLabel;
+  }
+
+  return rawTitle;
+}
+
+function normalizedUrlPathSegments(pathname) {
+  return String(pathname ?? "")
+    .split("/")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function youtubeVideoIdFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl ?? ""));
+    const host = parsed.hostname.toLowerCase();
+    const segments = normalizedUrlPathSegments(parsed.pathname);
+    const idPattern = /^[A-Za-z0-9_-]{6,20}$/;
+
+    if (host === "youtu.be") {
+      const candidate = segments[0] ?? "";
+      return idPattern.test(candidate) ? candidate : null;
+    }
+
+    if (!host.includes("youtube")) {
+      return null;
+    }
+
+    if (segments[0] === "watch") {
+      const candidate = String(parsed.searchParams.get("v") ?? "").trim();
+      return idPattern.test(candidate) ? candidate : null;
+    }
+
+    if (segments[0] === "shorts" || segments[0] === "live" || segments[0] === "embed") {
+      const candidate = segments[1] ?? "";
+      return idPattern.test(candidate) ? candidate : null;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function tiktokVideoIdFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl ?? ""));
+    const host = parsed.hostname.toLowerCase();
+
+    if (!host.includes("tiktok.com")) {
+      return null;
+    }
+
+    const segments = normalizedUrlPathSegments(parsed.pathname);
+    const videoIndex = segments.findIndex((segment) => segment.toLowerCase() === "video");
+
+    if (videoIndex >= 0 && videoIndex + 1 < segments.length) {
+      const candidate = segments[videoIndex + 1];
+      return /^\d{6,}$/.test(candidate) ? candidate : null;
+    }
+
+    const match = parsed.pathname.match(/\/video\/(\d{6,})/i);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function tiktokUsernameFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl ?? ""));
+    const host = parsed.hostname.toLowerCase();
+
+    if (!host.includes("tiktok.com")) {
+      return null;
+    }
+
+    const segments = normalizedUrlPathSegments(parsed.pathname);
+    const username = segments.find((segment) => segment.startsWith("@")) ?? null;
+
+    if (!username || username.length < 2) {
+      return null;
+    }
+
+    return username;
+  } catch {
+    return null;
+  }
+}
+
+function linkPreviewEmbedInfo(preview) {
+  if (!preview || typeof preview !== "object") {
+    return null;
+  }
+
+  const provider = String(preview.providerKey ?? "").trim().toLowerCase();
+
+  if (provider === "youtube") {
+    const videoId = youtubeVideoIdFromUrl(preview.url);
+
+    if (!videoId) {
+      return null;
+    }
+
+    const params = new URLSearchParams({
+      autoplay: "1",
+      rel: "0",
+      modestbranding: "1",
+      playsinline: "1"
+    });
+    const pageOrigin = String(window.location?.origin ?? "").trim();
+
+    if (/^https?:\/\//i.test(pageOrigin)) {
+      params.set("origin", pageOrigin);
+      params.set("widget_referrer", pageOrigin);
+    }
+
+    return {
+      provider,
+      embedUrl: `https://www.youtube.com/embed/${videoId}?${params.toString()}`
+    };
+  }
+
+  if (provider === "tiktok") {
+    const videoId = tiktokVideoIdFromUrl(preview.url);
+
+    if (!videoId) {
+      return null;
+    }
+
+    const primaryParams = new URLSearchParams({
+      autoplay: "1",
+      controls: "1",
+      description: "0",
+      music_info: "0",
+      progress_bar: "1",
+      timestamp: "1",
+      rel: "0"
+    });
+    const fallbackParams = new URLSearchParams({
+      autoplay: "1",
+      controls: "1",
+      description: "0",
+      music_info: "0",
+      rel: "0"
+    });
+
+    return {
+      provider,
+      embedUrl: `https://www.tiktok.com/player/v1/${videoId}?${primaryParams.toString()}`,
+      fallbackEmbedUrl: `https://www.tiktok.com/embed/v2/${videoId}?${fallbackParams.toString()}`
+    };
+  }
+
+  return null;
+}
+
+function buildLinkPreviewEmbedIframe(embedInfo, preview) {
+  if (!embedInfo?.embedUrl) {
+    return null;
+  }
+
+  const iframe = document.createElement("iframe");
+  iframe.className = "message-link-preview-iframe";
+  iframe.src = embedInfo.embedUrl;
+  iframe.loading = "eager";
+  iframe.referrerPolicy = "strict-origin-when-cross-origin";
+  iframe.allowFullscreen = true;
+  iframe.title = `${preview?.siteName || "Link"} video preview`;
+
+  if (embedInfo.provider === "youtube") {
+    iframe.setAttribute(
+      "allow",
+      "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    );
+  } else if (embedInfo.provider === "tiktok") {
+    iframe.setAttribute(
+      "allow",
+      "autoplay; clipboard-write; encrypted-media; picture-in-picture; web-share"
+    );
+  } else {
+    iframe.setAttribute("allow", "autoplay; encrypted-media; picture-in-picture");
+  }
+
+  return iframe;
+}
+
+function renderMessageLinkPreview(message) {
+  const preview = normalizeMessageLinkPreview(message?.linkPreview);
+
+  if (!preview || message?.deleted) {
+    return null;
+  }
+
+  const card = document.createElement("article");
+  card.className = "message-link-preview";
+  card.classList.add(`provider-${preview.providerKey}`);
+  card.style.setProperty("--preview-accent", linkPreviewAccentColor(preview.providerKey));
+
+  let hostLabel = "";
+
+  try {
+    hostLabel = new URL(preview.url).hostname;
+  } catch {}
+
+  const providerLabel = linkPreviewProviderLabel(preview) || hostLabel;
+  const titleText = linkPreviewDisplayTitle(preview, providerLabel, hostLabel);
+  const isVideoProvider = preview.providerKey === "youtube" || preview.providerKey === "tiktok";
+  const hideSiteLine =
+    isVideoProvider ||
+    normalizePreviewLabel(providerLabel) === normalizePreviewLabel(titleText) ||
+    normalizePreviewLabel(titleText) === normalizePreviewLabel(`open on ${providerLabel}`);
+
+  const body = document.createElement("div");
+  body.className = "message-link-preview-body";
+
+  if (!hideSiteLine) {
+    const site = document.createElement("p");
+    site.className = "message-link-preview-site";
+    site.textContent = providerLabel || preview.siteName;
+    body.append(site);
+  }
+
+  if (preview.authorName) {
+    const author = document.createElement("p");
+    author.className = "message-link-preview-author";
+    author.textContent = preview.authorName;
+    body.append(author);
+  }
+
+  const title = document.createElement("a");
+  title.className = "message-link-preview-title";
+  title.textContent = titleText;
+  title.href = preview.url;
+  title.target = "_blank";
+  title.rel = "noopener noreferrer";
+
+  if (preview.providerKey === "youtube" || preview.providerKey === "tiktok") {
+    title.classList.add("accent");
+  }
+  body.append(title);
+
+  if (preview.description) {
+    const description = document.createElement("p");
+    description.className = "message-link-preview-description";
+    description.textContent = preview.description;
+    body.append(description);
+  }
+
+  const embedInfo = linkPreviewEmbedInfo(preview);
+
+  if (preview.imageUrl || embedInfo) {
+    const media = document.createElement("div");
+    media.className = "message-link-preview-media";
+
+    if (embedInfo?.provider === "tiktok") {
+      media.classList.add("tiktok");
+    }
+
+    if (preview.imageUrl) {
+      const image = document.createElement("img");
+      image.className = "message-link-preview-image";
+      image.src = preview.imageUrl;
+      image.alt = preview.title;
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.referrerPolicy = "no-referrer";
+      image.addEventListener("error", () => {
+        image.remove();
+      });
+      media.append(image);
+    }
+
+    if (embedInfo) {
+      const playButton = document.createElement("button");
+      playButton.type = "button";
+      playButton.className = "message-link-preview-play";
+      playButton.setAttribute("aria-label", "Play video preview");
+      playButton.innerHTML =
+        '<span class="message-link-preview-play-icon" aria-hidden="true">\u25B6</span>';
+
+      playButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (media.dataset.embedActive === "1") {
+          return;
+        }
+
+        const tryMountEmbed = (embedUrl, isFallbackAttempt) => {
+          const iframe = buildLinkPreviewEmbedIframe(
+            {
+              ...embedInfo,
+              embedUrl
+            },
+            preview
+          );
+
+          if (!iframe) {
+            return;
+          }
+
+          media.dataset.embedActive = "1";
+          media.classList.add("loading");
+          playButton.disabled = true;
+
+          let settled = false;
+          const loadTimeoutMs = embedInfo.provider === "tiktok" ? 9000 : 6500;
+
+          const failAttempt = (errorMessage) => {
+            if (settled) {
+              return;
+            }
+
+            settled = true;
+            iframe.remove();
+            media.classList.remove("loading");
+
+            const hasFallback =
+              embedInfo.provider === "tiktok" &&
+              !isFallbackAttempt &&
+              String(embedInfo.fallbackEmbedUrl ?? "").trim().length > 0;
+
+            if (hasFallback) {
+              tryMountEmbed(embedInfo.fallbackEmbedUrl, true);
+              return;
+            }
+
+            media.dataset.embedActive = "0";
+            playButton.disabled = false;
+            showToast(errorMessage);
+          };
+
+          const loadTimeout = window.setTimeout(() => {
+            failAttempt("Embedded video is taking too long. Open with the title link instead.");
+          }, loadTimeoutMs);
+
+          iframe.addEventListener("load", () => {
+            if (settled) {
+              return;
+            }
+
+            settled = true;
+            clearTimeout(loadTimeout);
+            media.classList.remove("loading");
+            media.classList.add("playing");
+          });
+
+          iframe.addEventListener("error", () => {
+            clearTimeout(loadTimeout);
+            failAttempt("Could not load embedded video.");
+          });
+
+          media.append(iframe);
+        };
+
+        tryMountEmbed(embedInfo.embedUrl, false);
+      });
+
+      media.append(playButton);
+    }
+
+    body.append(media);
+  }
+
+  card.append(body);
+  return card;
 }
 
 function addRoundedRectPath(context, x, y, width, height, radius) {
@@ -3256,6 +5029,14 @@ function renderMessages(chat) {
     }
 
     if (!message.deleted) {
+      const linkPreview = renderMessageLinkPreview(message);
+
+      if (linkPreview) {
+        card.append(linkPreview);
+      }
+    }
+
+    if (!message.deleted) {
       const attachments = renderMessageAttachments(message);
       if (attachments) {
         card.append(attachments);
@@ -3306,8 +5087,17 @@ function renderAttachmentPreview() {
   for (const attachment of state.pendingAttachments) {
     const item = document.createElement("div");
     item.className = "attachment-chip";
+    const preparing = attachment.isPreparing === true;
+    const progress = Math.max(0, Math.min(100, Number(attachment.progress) || 0));
 
-    if (String(attachment.type ?? "").startsWith("image/")) {
+    if (preparing || state.composerSending) {
+      item.classList.add("with-progress");
+    }
+
+    if (
+      String(attachment.type ?? "").startsWith("image/") &&
+      String(attachment.dataUrl ?? "").startsWith("data:")
+    ) {
       const thumb = document.createElement("img");
       thumb.src = attachment.dataUrl;
       thumb.alt = attachment.name;
@@ -3322,6 +5112,7 @@ function renderAttachmentPreview() {
     remove.type = "button";
     remove.className = "chip-remove";
     remove.textContent = "x";
+    remove.disabled = state.composerSending;
     remove.addEventListener("click", () => {
       state.pendingAttachments = state.pendingAttachments.filter(
         (entry) => entry.id !== attachment.id
@@ -3330,11 +5121,30 @@ function renderAttachmentPreview() {
     });
 
     item.append(name, remove);
+
+    if (preparing || state.composerSending) {
+      const status = document.createElement("p");
+      status.className = "attachment-progress-label";
+      status.textContent = state.composerSending
+        ? "Sending..."
+        : `Preparing ${Math.max(0, Math.min(100, progress))}%`;
+      item.append(status);
+
+      const progressTrack = document.createElement("div");
+      progressTrack.className = "attachment-progress-track";
+      const progressFill = document.createElement("div");
+      progressFill.className = "attachment-progress-fill";
+      progressFill.style.width = `${state.composerSending ? 100 : progress}%`;
+      progressTrack.append(progressFill);
+      item.append(progressTrack);
+    }
+
     elements.attachmentPreview.append(item);
   }
 }
 
 function clearPendingAttachments() {
+  state.composerSending = false;
   state.pendingAttachments = [];
   elements.fileInput.value = "";
   elements.photoInput.value = "";
@@ -3350,11 +5160,18 @@ function renderActiveChat() {
     stopLocalTyping();
   }
 
+  if (state.voiceNoteRecorder && state.voiceNoteChatId && state.voiceNoteChatId !== chat?.id) {
+    stopVoiceNoteRecording(false, true);
+  }
+
   if (!chat) {
+    activeComposerDraftChatId = null;
     elements.messageSearchInput.disabled = true;
     elements.chatTitle.textContent = "Select a chat";
     elements.chatSubtitle.textContent = "Tap a friend to start chatting.";
     setComposerEnabled(false);
+    elements.messageInput.value = "";
+    resizeComposerInput();
     clearPendingAttachments();
     clearReplyTarget();
     renderTypingIndicator();
@@ -3362,20 +5179,28 @@ function renderActiveChat() {
     renderCallChat();
     updateHeaderActions();
     renderProfilePanel();
+    applyActiveChatAppearance();
+    updateVoiceNoteButton();
     return;
   }
 
   elements.messageSearchInput.disabled = false;
+  const prefs = activeChatViewerPrefs();
+  const hasNickname = Boolean(prefs.nickname);
 
   if (chat.type === "group") {
-    elements.chatTitle.textContent = `${chat.name || "Group chat"} (Group)`;
+    elements.chatTitle.textContent = hasNickname ? prefs.nickname : `${chat.name || "Group chat"} (Group)`;
     elements.chatSubtitle.textContent = `Group chat with ${chat.participants.length} members`;
   } else {
     const target = currentDirectTarget();
     if (chat.type === "temp") {
-      elements.chatTitle.textContent = target ? `${target.name} (Temp)` : "Temp chat";
+      elements.chatTitle.textContent = hasNickname
+        ? prefs.nickname
+        : target
+          ? `${target.name} (Temp)`
+          : "Temp chat";
     } else {
-      elements.chatTitle.textContent = target ? target.name : "Direct chat";
+      elements.chatTitle.textContent = hasNickname ? prefs.nickname : target ? target.name : "Direct chat";
     }
     elements.chatSubtitle.textContent =
       chat.type === "temp"
@@ -3397,35 +5222,69 @@ function renderActiveChat() {
   }
 
   setComposerEnabled(true);
+  if (activeComposerDraftChatId !== chat.id) {
+    restoreDraftForActiveChat();
+    activeComposerDraftChatId = chat.id;
+  }
+  applyActiveChatAppearance();
   renderMessages(chat);
   renderTypingIndicator();
   renderCallChat();
   updateHeaderActions();
   renderProfilePanel();
   markActiveChatRead();
+  updateVoiceNoteButton();
 }
 
-function readFileAsDataUrl(file) {
+function readFileAsDataUrl(file, onProgress) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
 
+    if (typeof onProgress === "function") {
+      onProgress(0);
+      reader.onprogress = (event) => {
+        if (!event.lengthComputable) {
+          return;
+        }
+
+        const ratio = event.total > 0 ? event.loaded / event.total : 0;
+        const percentage = Math.max(0, Math.min(100, Math.round(ratio * 100)));
+        onProgress(percentage);
+      };
+    }
+
     reader.onload = () => resolve(String(reader.result ?? ""));
     reader.onerror = () => reject(new Error("Could not read file."));
+    reader.onloadend = () => {
+      if (typeof onProgress === "function") {
+        onProgress(100);
+      }
+    };
     reader.readAsDataURL(file);
   });
 }
 
 function serializeAttachmentsForSend(attachments) {
   const source = Array.isArray(attachments) ? attachments : [];
-  return source.map((attachment) => ({
-    name: attachment.name,
-    type: attachment.type,
-    size: attachment.size,
-    dataUrl: attachment.dataUrl
-  }));
+  return source
+    .filter((attachment) => {
+      return (
+        attachment &&
+        !attachment.isPreparing &&
+        String(attachment.dataUrl ?? "").startsWith("data:")
+      );
+    })
+    .map((attachment) => ({
+      name: attachment.name,
+      type: attachment.type,
+      size: attachment.size,
+      dataUrl: attachment.dataUrl,
+      durationSeconds: sanitizeAttachmentDurationSeconds(attachment.durationSeconds)
+    }));
 }
 
 function sendMessageToActiveChat({
+  chatId = null,
   text = "",
   attachments = [],
   replyToMessageId = null,
@@ -3433,28 +5292,54 @@ function sendMessageToActiveChat({
   onSuccess,
   onFailure
 } = {}) {
-  if (!state.activeChat) {
+  const targetChatId = String(chatId ?? state.activeChat?.id ?? "").trim();
+
+  if (!targetChatId) {
     showToast("Open a chat first.");
     return Promise.resolve(false);
   }
 
   const outgoingText = String(text ?? "").trim();
+  const pendingAttachments = Array.isArray(attachments) ? attachments : [];
+  const preparingCount = pendingAttachments.filter((attachment) => attachment?.isPreparing).length;
+
+  if (preparingCount > 0) {
+    showToast("Please wait for attachments to finish uploading.");
+    return Promise.resolve(false);
+  }
+
   const outgoingAttachments = serializeAttachmentsForSend(attachments);
 
   if (!outgoingText && outgoingAttachments.length === 0) {
     return Promise.resolve(false);
   }
 
+  const shouldShowComposerSendingState =
+    clearComposerOnSuccess &&
+    state.activeChat?.id === targetChatId &&
+    outgoingAttachments.length > 0 &&
+    !chatId;
+
+  if (shouldShowComposerSendingState) {
+    state.composerSending = true;
+    renderAttachmentPreview();
+  }
+
   return new Promise((resolve) => {
     socket.emit(
       "send_message",
       {
-        chatId: state.activeChat.id,
+        chatId: targetChatId,
         text: outgoingText,
         attachments: outgoingAttachments,
         replyToMessageId: replyToMessageId ?? null
       },
       (response) => {
+        if (shouldShowComposerSendingState) {
+          state.composerSending = false;
+          renderAttachmentPreview();
+        }
+
         if (!response?.ok) {
           showToast(response?.error ?? "Failed to send message.");
 
@@ -3466,8 +5351,14 @@ function sendMessageToActiveChat({
           return;
         }
 
-        if (clearComposerOnSuccess) {
+        const shouldClearComposer =
+          clearComposerOnSuccess && state.activeChat?.id === targetChatId;
+
+        if (shouldClearComposer) {
+          const activeChatId = state.activeChat?.id;
           elements.messageInput.value = "";
+          clearStoredDraft(activeChatId);
+          resizeComposerInput();
           stopLocalTyping();
           clearReplyTarget();
           clearPendingAttachments();
@@ -3485,15 +5376,35 @@ function sendMessageToActiveChat({
   });
 }
 
-async function createAttachmentFromFile(file) {
-  const dataUrl = await readFileAsDataUrl(file);
+function submitComposerMessage() {
+  return sendMessageToActiveChat({
+    text: elements.messageInput.value,
+    attachments: state.pendingAttachments,
+    replyToMessageId: state.replyingTo?.messageId ?? null,
+    clearComposerOnSuccess: true
+  });
+}
+
+async function createAttachmentFromFile(file, options = {}) {
+  const attachmentId = String(options?.id ?? crypto.randomUUID());
+  const progressHandler =
+    typeof options?.onProgress === "function" ? options.onProgress : null;
+  const durationSeconds = sanitizeAttachmentDurationSeconds(options?.durationSeconds);
+  const dataUrl = await readFileAsDataUrl(file, (progressValue) => {
+    if (!progressHandler) {
+      return;
+    }
+
+    progressHandler(attachmentId, progressValue);
+  });
 
   return {
-    id: crypto.randomUUID(),
+    id: attachmentId,
     name: file.name || "file",
     type: file.type || "application/octet-stream",
     size: file.size,
-    dataUrl
+    dataUrl,
+    durationSeconds
   };
 }
 
@@ -3518,9 +5429,66 @@ async function addSelectedFiles(fileList, options = {}) {
       continue;
     }
 
+    const attachmentId = crypto.randomUUID();
+    let pendingEntry = null;
+
+    if (!sendImmediately) {
+      pendingEntry = {
+        id: attachmentId,
+        name: file.name || "file",
+        type: file.type || "application/octet-stream",
+        size: file.size,
+        dataUrl: "",
+        isPreparing: true,
+        progress: 0
+      };
+      state.pendingAttachments.push(pendingEntry);
+      renderAttachmentPreview();
+    }
+
     try {
-      preparedAttachments.push(await createAttachmentFromFile(file));
+      const prepared = await createAttachmentFromFile(file, {
+        id: attachmentId,
+        onProgress: (id, progressValue) => {
+          if (sendImmediately) {
+            return;
+          }
+
+          const target = state.pendingAttachments.find((entry) => entry.id === id);
+
+          if (!target) {
+            return;
+          }
+
+          target.progress = Math.max(0, Math.min(100, Number(progressValue) || 0));
+          renderAttachmentPreview();
+        }
+      });
+
+      if (sendImmediately) {
+        preparedAttachments.push(prepared);
+      } else {
+        const target = state.pendingAttachments.find((entry) => entry.id === attachmentId);
+
+        if (!target) {
+          continue;
+        }
+
+        Object.assign(target, prepared, {
+          isPreparing: false,
+          progress: 100
+        });
+        preparedAttachments.push(prepared);
+        renderAttachmentPreview();
+      }
     } catch {
+      if (!sendImmediately) {
+        state.pendingAttachments = state.pendingAttachments.filter(
+          (entry) => entry.id !== attachmentId
+        );
+        renderAttachmentPreview();
+      }
+
       showToast(`Could not attach ${file.name}.`);
     }
   }
@@ -3539,9 +5507,322 @@ async function addSelectedFiles(fileList, options = {}) {
     return preparedAttachments;
   }
 
-  state.pendingAttachments.push(...preparedAttachments);
-  renderAttachmentPreview();
   return preparedAttachments;
+}
+
+function voiceNoteSupported() {
+  return Boolean(window.MediaRecorder && navigator.mediaDevices?.getUserMedia);
+}
+
+function preferredVoiceNoteMimeType() {
+  if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== "function") {
+    return "";
+  }
+
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
+
+  for (const candidate of candidates) {
+    if (MediaRecorder.isTypeSupported(candidate)) {
+      return candidate;
+    }
+  }
+
+  return "";
+}
+
+function voiceNoteExtensionFromMimeType(mimeType) {
+  const normalized = String(mimeType ?? "").toLowerCase();
+
+  if (normalized.includes("ogg")) {
+    return "ogg";
+  }
+
+  if (normalized.includes("mp4")) {
+    return "mp4";
+  }
+
+  return "webm";
+}
+
+function formatVoiceNoteDuration(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor(Number(milliseconds || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function stopVoiceNoteTracks() {
+  const stream = state.voiceNoteStream;
+
+  if (!stream) {
+    return;
+  }
+
+  for (const track of stream.getTracks()) {
+    track.stop();
+  }
+}
+
+function normalizeVoiceNoteMimeType(value) {
+  const normalized = String(value ?? "").toLowerCase();
+
+  if (normalized.includes("ogg")) {
+    return "audio/ogg";
+  }
+
+  if (normalized.includes("mp4") || normalized.includes("m4a")) {
+    return "audio/mp4";
+  }
+
+  return "audio/webm";
+}
+
+function resetVoiceNoteState({ preserveFinalizing = false } = {}) {
+  clearVoiceNoteDurationTimer();
+  stopVoiceNoteTracks();
+  state.voiceNoteStream = null;
+  state.voiceNoteRecorder = null;
+  state.voiceNoteChunks = [];
+  state.voiceNoteMimeType = "";
+  state.voiceNoteStartedAt = 0;
+  state.voiceNoteChatId = null;
+
+  if (!preserveFinalizing) {
+    state.voiceNoteFinalizing = false;
+  }
+
+  updateVoiceNoteButton();
+}
+
+function updateVoiceNoteButton() {
+  if (!elements.attachVoiceNoteButton) {
+    return;
+  }
+
+  if (!voiceNoteSupported()) {
+    elements.attachVoiceNoteButton.disabled = true;
+    elements.attachVoiceNoteButton.textContent = "Voice N/A";
+    elements.attachVoiceNoteButton.classList.remove("recording");
+    return;
+  }
+
+  if (state.voiceNoteFinalizing) {
+    elements.attachVoiceNoteButton.disabled = true;
+    elements.attachVoiceNoteButton.textContent = "Sending voice...";
+    elements.attachVoiceNoteButton.classList.remove("recording");
+    return;
+  }
+
+  const enabled = Boolean(state.currentUser && state.activeChat && !elements.messageInput.disabled);
+  const isRecording = Boolean(state.voiceNoteRecorder);
+  elements.attachVoiceNoteButton.disabled = !enabled && !isRecording;
+
+  if (!isRecording) {
+    elements.attachVoiceNoteButton.textContent = "Voice Note";
+    elements.attachVoiceNoteButton.classList.remove("recording");
+    return;
+  }
+
+  const elapsed = Date.now() - Number(state.voiceNoteStartedAt || Date.now());
+  elements.attachVoiceNoteButton.textContent = `Stop Voice ${formatVoiceNoteDuration(elapsed)}`;
+  elements.attachVoiceNoteButton.classList.add("recording");
+}
+
+async function finalizeVoiceNoteRecording(chunks, mimeType, chatId, durationSeconds = null) {
+  const safeChunks = Array.isArray(chunks) ? chunks : [];
+
+  if (safeChunks.length === 0) {
+    showToast("No voice note captured.");
+    state.voiceNoteFinalizing = false;
+    updateVoiceNoteButton();
+    return;
+  }
+
+  const normalizedMimeType = normalizeVoiceNoteMimeType(mimeType);
+  const blob = new Blob(safeChunks, {
+    type: normalizedMimeType
+  });
+
+  if (blob.size > VOICE_NOTE_MAX_SIZE_BYTES) {
+    showToast("Voice note is larger than 5 MB.");
+    state.voiceNoteFinalizing = false;
+    updateVoiceNoteButton();
+    return;
+  }
+
+  const file = new File([blob], `voice-note-${Date.now()}.${voiceNoteExtensionFromMimeType(blob.type)}`, {
+    type: normalizeVoiceNoteMimeType(blob.type)
+  });
+
+  try {
+    const attachment = await createAttachmentFromFile(file, {
+      durationSeconds
+    });
+    const sent = await sendMessageToActiveChat({
+      chatId,
+      text: "",
+      attachments: [attachment],
+      replyToMessageId: null,
+      clearComposerOnSuccess: false
+    });
+
+    if (sent) {
+      showToast("Voice note sent.");
+    }
+  } catch {
+    showToast("Could not send voice note.");
+  } finally {
+    state.voiceNoteFinalizing = false;
+    updateVoiceNoteButton();
+  }
+}
+
+function stopVoiceNoteRecording(send = true, showCanceledToast = false) {
+  const recorder = state.voiceNoteRecorder;
+
+  if (!recorder) {
+    return;
+  }
+
+  const shouldSend = Boolean(send);
+  const mimeType = state.voiceNoteMimeType;
+  const chatId = state.voiceNoteChatId;
+  const startedAtTimestamp = Number(state.voiceNoteStartedAt || Date.now());
+  const elapsedSeconds = Math.max(0, (Date.now() - startedAtTimestamp) / 1000);
+  const estimatedDurationSeconds = sanitizeAttachmentDurationSeconds(elapsedSeconds);
+  state.voiceNoteFinalizing = shouldSend;
+  clearVoiceNoteDurationTimer();
+  updateVoiceNoteButton();
+  let handled = false;
+
+  const finalizeOnce = () => {
+    if (handled) {
+      return;
+    }
+
+    handled = true;
+    const chunksSnapshot = [...state.voiceNoteChunks];
+    resetVoiceNoteState({ preserveFinalizing: shouldSend });
+
+    if (!shouldSend) {
+      if (showCanceledToast) {
+        showToast("Voice note canceled.");
+      }
+      return;
+    }
+
+    finalizeVoiceNoteRecording(chunksSnapshot, mimeType, chatId, estimatedDurationSeconds);
+  };
+
+  recorder.onstop = finalizeOnce;
+  recorder.onerror = () => {
+    finalizeOnce();
+
+    if (shouldSend) {
+      showToast("Voice note canceled.");
+    }
+  };
+
+  try {
+    if (recorder.state === "inactive") {
+      finalizeOnce();
+      return;
+    }
+
+    recorder.stop();
+  } catch {
+    finalizeOnce();
+  }
+}
+
+async function startVoiceNoteRecording() {
+  if (!voiceNoteSupported()) {
+    showToast("Voice notes are not supported in this browser.");
+    return;
+  }
+
+  if (!state.activeChat || elements.messageInput.disabled) {
+    showToast("Open a chat first.");
+    return;
+  }
+
+  if (state.voiceNoteFinalizing) {
+    return;
+  }
+
+  if (state.voiceNoteRecorder) {
+    return;
+  }
+
+  let stream;
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false
+    });
+  } catch {
+    showToast("Microphone access is required for voice notes.");
+    return;
+  }
+
+  const mimeType = preferredVoiceNoteMimeType();
+  let recorder;
+
+  try {
+    recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+  } catch {
+    for (const track of stream.getTracks()) {
+      track.stop();
+    }
+    showToast("Could not start voice recording.");
+    return;
+  }
+
+  state.voiceNoteStream = stream;
+  state.voiceNoteRecorder = recorder;
+  state.voiceNoteChunks = [];
+  state.voiceNoteMimeType = mimeType || recorder.mimeType || "audio/webm";
+  state.voiceNoteStartedAt = Date.now();
+  state.voiceNoteChatId = state.activeChat.id;
+  state.voiceNoteFinalizing = false;
+
+  recorder.ondataavailable = (event) => {
+    if (event.data && event.data.size > 0) {
+      state.voiceNoteChunks.push(event.data);
+    }
+  };
+
+  recorder.onerror = () => {
+    stopVoiceNoteRecording(false, true);
+  };
+
+  try {
+    recorder.start(250);
+  } catch {
+    resetVoiceNoteState();
+    showToast("Could not start voice recording.");
+    return;
+  }
+
+  updateVoiceNoteButton();
+  clearVoiceNoteDurationTimer();
+  voiceNoteDurationTimer = window.setInterval(() => {
+    updateVoiceNoteButton();
+
+    if (Date.now() - Number(state.voiceNoteStartedAt || Date.now()) >= VOICE_NOTE_MAX_DURATION_MS) {
+      stopVoiceNoteRecording(true, false);
+    }
+  }, 250);
+}
+
+function toggleVoiceNoteRecording() {
+  if (state.voiceNoteRecorder) {
+    stopVoiceNoteRecording(true, false);
+    return;
+  }
+
+  startVoiceNoteRecording();
 }
 
 function buildSpacePrefixedInsert(value) {
@@ -6056,6 +8337,22 @@ elements.signupTabButton.addEventListener("click", () => {
   setAuthMode("signup");
 });
 
+if (elements.authPasswordToggleButton) {
+  elements.authPasswordToggleButton.addEventListener("click", () => {
+    const shouldShow = elements.authPasswordInput.type === "password";
+    setAuthPasswordVisibility(shouldShow);
+    elements.authPasswordInput.focus();
+  });
+}
+
+if (elements.authConfirmToggleButton) {
+  elements.authConfirmToggleButton.addEventListener("click", () => {
+    const shouldShow = elements.authConfirmInput.type === "password";
+    setAuthConfirmPasswordVisibility(shouldShow);
+    elements.authConfirmInput.focus();
+  });
+}
+
 elements.authForm.addEventListener("submit", (event) => {
   event.preventDefault();
 
@@ -6078,14 +8375,18 @@ elements.authForm.addEventListener("submit", (event) => {
 
   const eventName = state.authMode === "signup" ? "signup" : "login";
 
-  socket.emit(eventName, { username, password }, (response) => {
-    if (!response?.ok) {
-      showToast(response?.error ?? "Authentication failed.");
-      return;
-    }
+  socket.emit(
+    eventName,
+    { username, password, deviceName: currentDeviceName() },
+    (response) => {
+      if (!response?.ok) {
+        showToast(response?.error ?? "Authentication failed.");
+        return;
+      }
 
-    completeAuth(response);
-  });
+      completeAuth(response);
+    }
+  );
 });
 
 elements.friendForm.addEventListener("submit", (event) => {
@@ -6136,13 +8437,73 @@ elements.groupCreateModal.addEventListener("click", (event) => {
 
 elements.composerForm.addEventListener("submit", (event) => {
   event.preventDefault();
+  submitComposerMessage();
+});
 
-  sendMessageToActiveChat({
-    text: elements.messageInput.value,
-    attachments: state.pendingAttachments,
-    replyToMessageId: state.replyingTo?.messageId ?? null,
-    clearComposerOnSuccess: true
-  });
+elements.composerForm.addEventListener("dragenter", (event) => {
+  if (!hasFileDragPayload(event.dataTransfer)) {
+    return;
+  }
+
+  event.preventDefault();
+  composerDragDepth += 1;
+
+  if (composerCanAcceptFiles()) {
+    setComposerDragActive(true);
+  }
+});
+
+elements.composerForm.addEventListener("dragover", (event) => {
+  if (!hasFileDragPayload(event.dataTransfer)) {
+    return;
+  }
+
+  event.preventDefault();
+
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "copy";
+  }
+
+  if (composerCanAcceptFiles()) {
+    setComposerDragActive(true);
+  }
+});
+
+elements.composerForm.addEventListener("dragleave", () => {
+  if (composerDragDepth <= 0) {
+    return;
+  }
+
+  composerDragDepth = Math.max(0, composerDragDepth - 1);
+  if (composerDragDepth === 0) {
+    setComposerDragActive(false);
+  }
+});
+
+elements.composerForm.addEventListener("drop", async (event) => {
+  if (!hasFileDragPayload(event.dataTransfer)) {
+    return;
+  }
+
+  event.preventDefault();
+  resetComposerDragState();
+
+  if (!composerCanAcceptFiles()) {
+    return;
+  }
+
+  await addSelectedFiles(event.dataTransfer?.files ?? []);
+});
+
+elements.messageInput.addEventListener("paste", async (event) => {
+  const files = [...(event.clipboardData?.files ?? [])];
+
+  if (files.length === 0 || !composerCanAcceptFiles()) {
+    return;
+  }
+
+  event.preventDefault();
+  await addSelectedFiles(files);
 });
 
 elements.messageSearchInput.addEventListener("input", () => {
@@ -6262,6 +8623,8 @@ elements.cameraInput.addEventListener("change", async () => {
 });
 
 elements.messageInput.addEventListener("input", () => {
+  resizeComposerInput();
+  storeActiveChatDraft();
   touchLocalTypingState();
 });
 
@@ -6269,13 +8632,32 @@ elements.messageInput.addEventListener("focus", () => {
   touchLocalTypingState();
 });
 
-elements.messageInput.addEventListener("keydown", () => {
+elements.messageInput.addEventListener("keydown", (event) => {
+  const shouldSend =
+    event.key === "Enter" &&
+    !event.shiftKey &&
+    !event.altKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.isComposing;
+
+  if (state.enterToSendEnabled && shouldSend) {
+    event.preventDefault();
+
+    if (state.activeChat && !elements.messageInput.disabled) {
+      submitComposerMessage();
+    }
+  }
+
   window.requestAnimationFrame(() => {
+    storeActiveChatDraft();
+    resizeComposerInput();
     touchLocalTypingState();
   });
 });
 
 elements.messageInput.addEventListener("blur", () => {
+  storeActiveChatDraft();
   touchLocalTypingState();
 });
 
@@ -6286,6 +8668,12 @@ elements.voiceCallButton.addEventListener("click", () => {
 elements.videoCallButton.addEventListener("click", () => {
   startOutgoingCall("video");
 });
+
+if (elements.chatPrefsButton) {
+  elements.chatPrefsButton.addEventListener("click", (event) => {
+    openActiveChatStyleMenu(event.currentTarget);
+  });
+}
 
 elements.openTempChatButton.addEventListener("click", () => {
   const target = currentDirectTarget();
@@ -6301,6 +8689,12 @@ elements.openTempChatButton.addEventListener("click", () => {
 elements.closeTempChatButton.addEventListener("click", () => {
   voteCloseTempChat();
 });
+
+if (elements.attachVoiceNoteButton) {
+  elements.attachVoiceNoteButton.addEventListener("click", () => {
+    toggleVoiceNoteRecording();
+  });
+}
 
 elements.settingsButton.addEventListener("click", () => {
   openSettingsModal();
@@ -6420,6 +8814,39 @@ elements.changePasswordButton.addEventListener("click", () => {
   });
 });
 
+if (elements.revokeOtherSessionsButton) {
+  elements.revokeOtherSessionsButton.addEventListener("click", () => {
+    if (!state.currentUser || state.settingsSessionsLoading) {
+      return;
+    }
+
+    state.settingsSessionsLoading = true;
+    renderSettingsSessions();
+
+    socket.emit("revoke_other_sessions", {}, (response) => {
+      state.settingsSessionsLoading = false;
+
+      if (!response?.ok) {
+        showToast(response?.error ?? "Could not sign out other devices.");
+        renderSettingsSessions();
+        return;
+      }
+
+      state.settingsSessions = Array.isArray(response.sessions) ? response.sessions : [];
+      renderSettingsSessions();
+
+      const revokedCount = Number(response?.revokedCount ?? 0);
+
+      if (revokedCount > 0) {
+        showToast(`Signed out ${revokedCount} device${revokedCount === 1 ? "" : "s"}.`);
+        return;
+      }
+
+      showToast("No other devices were signed in.");
+    });
+  });
+}
+
 elements.deleteAccountButton.addEventListener("click", () => {
   const password = elements.settingsDeletePasswordInput.value;
 
@@ -6483,6 +8910,14 @@ elements.enableNotificationsButton.addEventListener("click", async () => {
   setNotificationsEnabled(false);
   showToast("Notifications blocked.");
 });
+
+if (elements.toggleEnterToSendButton) {
+  elements.toggleEnterToSendButton.addEventListener("click", () => {
+    const nextEnabled = !state.enterToSendEnabled;
+    setEnterToSendEnabled(nextEnabled);
+    showToast(nextEnabled ? "Enter now sends messages." : "Enter now inserts a new line.");
+  });
+}
 
 elements.logoutButton.addEventListener("click", () => {
   const sessionId = state.sessionId;
@@ -6693,6 +9128,33 @@ socket.on("account_deleted", () => {
   setSessionId(null);
   cleanupCall(false);
   showToast("Your account was deleted.");
+  socket.disconnect();
+  window.location.reload();
+});
+
+socket.on("sessions_updated", (payload) => {
+  if (!state.currentUser) {
+    return;
+  }
+
+  state.settingsSessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+  state.settingsSessionsLoading = false;
+
+  if (!elements.settingsModal.classList.contains("hidden")) {
+    renderSettingsSessions();
+  }
+});
+
+socket.on("session_revoked", (payload) => {
+  const revokedSessionId = String(payload?.sessionId ?? "").trim();
+
+  if (state.sessionId && revokedSessionId && revokedSessionId !== state.sessionId) {
+    return;
+  }
+
+  setSessionId(null);
+  cleanupCall(false);
+  showToast("This device was signed out.");
   socket.disconnect();
   window.location.reload();
 });
@@ -7086,9 +9548,14 @@ socket.on("call_chat_message", (payload) => {
 
 socket.on("disconnect", () => {
   state.isResumingSession = false;
+  state.settingsSessionsLoading = false;
   state.typingByChatId = {};
+  if (state.voiceNoteRecorder) {
+    stopVoiceNoteRecording(false);
+  }
   stopLocalTyping();
   renderTypingIndicator();
+  renderSettingsSessions();
   cleanupCall(false);
   showToast("Disconnected from server.");
 });
@@ -7106,6 +9573,8 @@ updateHeaderActions();
 updateCallControlButtons();
 syncCallFocusState();
 updateNotificationToggleButton();
+updateEnterToSendToggleButton();
+renderSettingsSessions();
 renderReplyPreview();
 renderTypingIndicator();
 renderCallQualityBadge();
@@ -7114,4 +9583,3 @@ syncAttachMenuButtonState();
 renderGifResults();
 updateJumpToUnreadButton();
 window.setInterval(pruneTypingState, 1000);
-
