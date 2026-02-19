@@ -582,6 +582,7 @@
             <div id="callVideos" class="call-videos">
               <video id="remoteVideo" autoplay playsinline></video>
               <video id="remoteCameraVideo" class="hidden" autoplay playsinline></video>
+              <p id="remoteVideoName" class="call-video-name remote">Friend</p>
               <div id="remoteVideoPlaceholder" class="video-placeholder hidden">
                 <div class="video-placeholder-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24" fill="none">
@@ -603,6 +604,7 @@
               </div>
               <canvas id="callAnnotationCanvas" class="call-annotation-canvas"></canvas>
               <video id="localVideo" autoplay playsinline muted></video>
+              <p id="localVideoName" class="call-video-name local">You</p>
             </div>
           </div>
           <aside id="callChatPanel" class="call-chat-panel">
@@ -628,8 +630,6 @@
           <button id="toggleScreenShareButton" class="action-button call-control" type="button">
             Share Screen
           </button>
-          <button id="toggleDrawButton" class="action-button call-control" type="button">Draw Off</button>
-          <button id="clearDrawButton" class="action-button call-control" type="button">Clear Draw</button>
           <button id="toggleCallChatButton" class="action-button call-control" type="button">
             Call Chat
           </button>
@@ -643,6 +643,7 @@
     <div id="toast" class="toast hidden"></div>
 
     <script src="/socket.io/socket.io.js"></script>
+    <script src="/runtime-config.js"></script>
     <script type="module" src="./app.js"></script>
   </body>
 </html>
