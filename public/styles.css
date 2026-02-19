@@ -630,7 +630,7 @@ button {
 }
 
 .messages.has-wallpaper {
-  background-attachment: local;
+  background-attachment: scroll;
 }
 
 .unread-divider {
@@ -2419,6 +2419,35 @@ button:disabled {
   transition: box-shadow 120ms ease, border-color 120ms ease;
 }
 
+.call-video-name {
+  position: absolute;
+  z-index: 6;
+  margin: 0;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(6, 6, 6, 0.64);
+  color: #ededed;
+  font-size: 0.73rem;
+  font-weight: 600;
+  line-height: 1.2;
+  max-width: min(72%, 240px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.call-video-name.remote {
+  top: 10px;
+  left: 10px;
+}
+
+.call-video-name.local {
+  right: 14px;
+  bottom: 14px;
+}
+
 #remoteCameraVideo {
   width: min(220px, 28vw);
   aspect-ratio: 16 / 10;
@@ -2618,6 +2647,32 @@ button:disabled {
   top: auto;
 }
 
+.call-videos.local-video-top-left .call-video-name.local {
+  top: calc(12px + (min(220px, 28vw) * 0.625) + 8px);
+  right: auto;
+  left: 12px;
+  bottom: auto;
+}
+
+.call-videos.local-video-top-right .call-video-name.local {
+  top: calc(12px + (min(220px, 28vw) * 0.625) + 8px);
+  right: 12px;
+  left: auto;
+  bottom: auto;
+}
+
+.call-videos.local-video-bottom-left .call-video-name.local {
+  bottom: calc(12px + (min(220px, 28vw) * 0.625) + 8px);
+  left: 12px;
+  right: auto;
+}
+
+.call-videos.local-video-bottom-right .call-video-name.local {
+  bottom: calc(12px + (min(220px, 28vw) * 0.625) + 8px);
+  right: 12px;
+  left: auto;
+}
+
 #remoteVideo.speaking,
 #localVideo.speaking,
 #remoteCameraVideo.speaking {
@@ -2625,7 +2680,11 @@ button:disabled {
   box-shadow: 0 0 0 3px rgba(168, 168, 168, 0.23), 0 0 16px rgba(168, 168, 168, 0.25);
 }
 
-.call-overlay.voice-mode .call-videos {
+.call-overlay.voice-mode:not(.voice-sharing) .call-videos {
+  display: none;
+}
+
+.call-overlay.voice-mode:not(.voice-sharing) .call-video-name {
   display: none;
 }
 
@@ -2633,8 +2692,62 @@ button:disabled {
   display: none;
 }
 
-.call-overlay.voice-mode .voice-call-panel {
+.call-overlay.voice-mode:not(.voice-sharing) .voice-call-panel {
   display: grid;
+}
+
+.call-overlay.voice-mode.voice-sharing .call-videos {
+  display: grid;
+}
+
+.call-overlay.voice-mode.voice-sharing .voice-call-panel {
+  display: block;
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 7;
+  min-height: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  pointer-events: none;
+  padding: 0;
+}
+
+.call-overlay.voice-mode.voice-sharing .voice-call-users {
+  width: auto;
+  display: block;
+  gap: 0;
+}
+
+.call-overlay.voice-mode.voice-sharing #voiceCallSelfUser {
+  display: none;
+}
+
+.call-overlay.voice-mode.voice-sharing #voiceCallRemoteUser {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(8, 8, 8, 0.72);
+  padding: 6px 10px 6px 6px;
+  backdrop-filter: blur(4px);
+}
+
+.call-overlay.voice-mode.voice-sharing #voiceCallRemoteUser .voice-call-avatar {
+  width: 34px;
+  height: 34px;
+  font-size: 0.78rem;
+}
+
+.call-overlay.voice-mode.voice-sharing #voiceCallRemoteUser .voice-call-name {
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.call-overlay.voice-mode.voice-sharing .call-video-name.remote {
+  display: none;
 }
 
 .call-controls {
@@ -2663,6 +2776,16 @@ button:disabled {
 
 .end-call {
   min-width: 122px;
+}
+
+.remote-call-audio {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  left: -9999px;
+  top: -9999px;
 }
 
 @keyframes ringPulse {
@@ -2985,6 +3108,21 @@ body.call-active .app-shell {
     width: min(160px, 38vw);
   }
 
+  .call-video-name {
+    font-size: 0.68rem;
+    max-width: min(76%, 180px);
+  }
+
+  .call-video-name.remote {
+    top: 8px;
+    left: 8px;
+  }
+
+  .call-video-name.local {
+    right: 10px;
+    bottom: 10px;
+  }
+
   #remoteCameraVideo {
     width: min(160px, 38vw);
     top: 10px;
@@ -3009,6 +3147,26 @@ body.call-active .app-shell {
   .call-videos.local-video-bottom-right #localVideo {
     right: 10px;
     bottom: 10px;
+  }
+
+  .call-videos.local-video-top-left .call-video-name.local {
+    top: calc(10px + (min(160px, 38vw) * 0.625) + 6px);
+    left: 10px;
+  }
+
+  .call-videos.local-video-top-right .call-video-name.local {
+    top: calc(10px + (min(160px, 38vw) * 0.625) + 6px);
+    right: 10px;
+  }
+
+  .call-videos.local-video-bottom-left .call-video-name.local {
+    bottom: calc(10px + (min(160px, 38vw) * 0.625) + 6px);
+    left: 10px;
+  }
+
+  .call-videos.local-video-bottom-right .call-video-name.local {
+    right: 10px;
+    bottom: calc(10px + (min(160px, 38vw) * 0.625) + 6px);
   }
 
   .voice-call-panel {
